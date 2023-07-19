@@ -1,28 +1,39 @@
 <div class="connect-load-database-container">
   <div class="form-container">
-    <form [formGroup]="connectForm" (ngSubmit)="connectToDb()">
+    <form [formGroup]="connectForm">
       <h3 class="primary-header">Connect to Source Database</h3>
 
       <mat-form-field class="full-width" appearance="outline">
         <mat-label>Database Engine</mat-label>
-        <mat-select matSelect name="dbEngine" formControlName="dbEngine" appearance="outline">
+        <mat-select formControlName="dbEngine" (selectionChange)="refreshDbSpecifcConnectionOptions()">
           <mat-option *ngFor="let element of dbEngineList" [value]="element.value">
             {{ element.displayName }}
           </mat-option>
         </mat-select>
       </mat-form-field>
 
+      <div class="shardingConfig" *ngIf="(connectForm.value.dbEngine === 'mysql')">
+        <mat-form-field appearance="outline">
+          <mat-label>Sharded Migration</mat-label>
+          <mat-select formControlName="isSharded">
+            <mat-option *ngFor="let element of shardedResponseList" [value]="element.value">
+              {{ element.displayName }}
+            </mat-option>
+          </mat-select>
+        </mat-form-field>
+        <mat-icon class="configure" matTooltip="Configure multiple source database instances (shards) and consolidate them by migrating to a single Cloud Spanner instance to take advantage of Spanner's horizontal scalability and consistency semantics.">info</mat-icon>
+        <br>
+        <b *ngIf="(connectForm.value.isSharded)">Note: For sharded migrations, please enter below the details of the
+          shard you want Harbourbridge to read the schema from. The complete connection configuration of all the shards
+          will be taken in later, during data migration.</b>
+      </div>
+
+      <br>
       <h3 class="primary-header">Connection Detail</h3>
 
       <mat-form-field class="full-width" appearance="outline">
         <mat-label>Hostname</mat-label>
-        <input
-          matInput
-          placeholder="127.0.0.1"
-          name="hostName"
-          type="text"
-          formControlName="hostName"
-        />
+        <input matInput placeholder="127.0.0.1" name="hostName" type="text" formControlName="hostName" />
       </mat-form-field>
 
       <mat-form-field class="full-width" appearance="outline">
@@ -46,7 +57,24 @@
         <input matInput name="dbname" type="text" formControlName="dbName" />
       </mat-form-field>
       <br />
-      <button mat-raised-button type="submit" color="primary" [disabled]="!connectForm.valid">
+      <h3 class="primary-header">Spanner Dialect</h3>
+      <mat-form-field class="full-width" appearance="outline">
+        <mat-label>Select a spanner dialect</mat-label>
+        <mat-select matSelect name="dialect" formControlName="dialect" appearance="outline">
+          <mat-option *ngFor="let element of dialect" [value]="element.value">
+            {{ element.displayName }}
+          </mat-option>
+        </mat-select>
+      </mat-form-field>
+      <br>
+      <mat-icon *ngIf="isTestConnectionSuccessful" class="success" matTooltip="Source Connection Successful"
+        matTooltipPosition="above">
+        check_circle
+      </mat-icon>
+      <button mat-raised-button type="submit" color="accent" [disabled]="!connectForm.valid" (click)="testConn()">
+        Test Connection
+      </button>
+      <button mat-raised-button type="submit" color="primary" [disabled]="!connectForm.valid || !isTestConnectionSuccessful" (click)="connectToDb()">
         Connect
       </button>
       <button mat-raised-button [routerLink]="'/'">Cancel</button>

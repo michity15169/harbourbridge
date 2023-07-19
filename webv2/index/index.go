@@ -60,30 +60,28 @@ func CheckIndexSuggestion(index []ddl.CreateIndex, spannerTable ddl.CreateTable)
 // If present adds Redundant as an issue in Issues.
 func checkRedundantIndex(index []ddl.CreateIndex, spannerTable ddl.CreateTable) {
 
-	var primaryKeyFirstColumn string
-	pks := spannerTable.Pks
+	var primaryKeyFirstColumnId string
+	pks := spannerTable.PrimaryKeys
 
 	for i := 0; i < len(index); i++ {
 
-		keys := index[i].Keys
-
 		for i := range pks {
 			if pks[i].Order == 1 {
-				primaryKeyFirstColumn = pks[i].Col
+				primaryKeyFirstColumnId = pks[i].ColId
 				break
 			}
 		}
+		if len(index[i].Keys) > 0 {
+			indexFirstColumnId := index[i].Keys[0].ColId
 
-		indexFirstColumn := index[i].Keys[0].Col
-
-		if primaryKeyFirstColumn == indexFirstColumn {
-			columnname := keys[0].Col
-			sessionState := session.GetSessionState()
-			schemaissue := sessionState.Conv.Issues[spannerTable.Name][columnname]
-			schemaissue = append(schemaissue, internal.RedundantIndex)
-			sessionState.Conv.Issues[spannerTable.Name][columnname] = schemaissue
+			if primaryKeyFirstColumnId == indexFirstColumnId {
+				columnId := indexFirstColumnId
+				sessionState := session.GetSessionState()
+				schemaissue := sessionState.Conv.SchemaIssues[spannerTable.Id].ColumnLevelIssues[columnId]
+				schemaissue = append(schemaissue, internal.RedundantIndex)
+				sessionState.Conv.SchemaIssues[spannerTable.Id].ColumnLevelIssues[columnId] = schemaissue
+			}
 		}
-
 	}
 }
 
@@ -92,63 +90,62 @@ func checkRedundantIndex(index []ddl.CreateIndex, spannerTable ddl.CreateTable) 
 func checkInterleaveIndex(index []ddl.CreateIndex, spannerTable ddl.CreateTable) {
 
 	// Suggestion gets added only if the table can be interleaved.
-	isInterleavable := spannerTable.Parent != ""
+	isInterleavable := spannerTable.ParentId != ""
 
 	if isInterleavable {
 
-		var primaryKeyFirstColumn string
-		pks := spannerTable.Pks
+		var primaryKeyFirstColumnId string
+		pks := spannerTable.PrimaryKeys
 
 		for i := 0; i < len(index); i++ {
 
 			for i := range pks {
 				if pks[i].Order == 1 {
-					primaryKeyFirstColumn = pks[i].Col
+					primaryKeyFirstColumnId = pks[i].ColId
 					break
 				}
 			}
+			if len(index[i].Keys) > 0 {
+				indexFirstColumnId := index[i].Keys[0].ColId
 
-			indexFirstColumn := index[i].Keys[0].Col
+				sessionState := session.GetSessionState()
 
-			sessionState := session.GetSessionState()
+				// Ensuring it is not a redundant index.
+				if primaryKeyFirstColumnId != indexFirstColumnId {
 
-			// Ensuring it is not a redundant index.
-			if primaryKeyFirstColumn != indexFirstColumn {
+					schemaissue := sessionState.Conv.SchemaIssues[spannerTable.Id].ColumnLevelIssues[indexFirstColumnId]
+					fks := spannerTable.ForeignKeys
 
-				schemaissue := sessionState.Conv.Issues[spannerTable.Name][indexFirstColumn]
-				fks := spannerTable.Fks
+					for i := range fks {
+						if fks[i].ColIds[0] == indexFirstColumnId {
+							schemaissue = append(schemaissue, internal.InterleaveIndex)
+							sessionState.Conv.SchemaIssues[spannerTable.Id].ColumnLevelIssues[indexFirstColumnId] = schemaissue
 
-				for i := range fks {
-					if fks[i].Columns[0] == indexFirstColumn {
-						schemaissue = append(schemaissue, internal.InterleaveIndex)
-						sessionState.Conv.Issues[spannerTable.Name][indexFirstColumn] = schemaissue
-
-					}
-				}
-
-				// Interleave suggestion if the column is of type auto increment.
-				if utilities.IsSchemaIssuePresent(schemaissue, internal.AutoIncrement) {
-					schemaissue = append(schemaissue, internal.AutoIncrementIndex)
-					sessionState.Conv.Issues[spannerTable.Name][indexFirstColumn] = schemaissue
-				}
-
-				for _, c := range spannerTable.ColDefs {
-
-					if indexFirstColumn == c.Name {
-
-						if c.T.Name == ddl.Timestamp {
-
-							columnname := c.Name
-							sessionState := session.GetSessionState()
-							schemaissue := sessionState.Conv.Issues[spannerTable.Name][columnname]
-
-							schemaissue = append(schemaissue, internal.AutoIncrementIndex)
-							sessionState.Conv.Issues[spannerTable.Name][columnname] = schemaissue
 						}
+					}
 
+					// Interleave suggestion if the column is of type auto increment.
+					if utilities.IsSchemaIssuePresent(schemaissue, internal.AutoIncrement) {
+						schemaissue = append(schemaissue, internal.AutoIncrementIndex)
+						sessionState.Conv.SchemaIssues[spannerTable.Id].ColumnLevelIssues[indexFirstColumnId] = schemaissue
+					}
+
+					for _, c := range spannerTable.ColDefs {
+
+						if indexFirstColumnId == c.Id {
+
+							if c.T.Name == ddl.Timestamp {
+
+								columnId := c.Id
+								sessionState := session.GetSessionState()
+								schemaissue := sessionState.Conv.SchemaIssues[spannerTable.Id].ColumnLevelIssues[columnId]
+
+								schemaissue = append(schemaissue, internal.AutoIncrementIndex)
+								sessionState.Conv.SchemaIssues[spannerTable.Id].ColumnLevelIssues[columnId] = schemaissue
+							}
+						}
 					}
 				}
-
 			}
 
 		}
@@ -159,35 +156,37 @@ func checkInterleaveIndex(index []ddl.CreateIndex, spannerTable ddl.CreateTable)
 // RemoveIndexIssues removes the issues in a column which is part of the passed Index.
 // This is called when we drop an index or make changes in the primarykey of the current table.
 // Editing the primary key can affect the issues in an index (eg. Changing pk order affects Redundant index issue).
-func RemoveIndexIssues(table string, Index ddl.CreateIndex) {
+func RemoveIndexIssues(tableId string, Index ddl.CreateIndex) {
 
 	for i := 0; i < len(Index.Keys); i++ {
 
-		column := Index.Keys[i].Col
+		columnId := Index.Keys[i].ColId
 
 		{
 			schemaissue := []internal.SchemaIssue{}
 			sessionState := session.GetSessionState()
-			if sessionState.Conv.Issues != nil {
-				schemaissue = sessionState.Conv.Issues[table][column]
+			if sessionState.Conv.SchemaIssues != nil {
+				schemaissue = sessionState.Conv.SchemaIssues[tableId].ColumnLevelIssues[columnId]
 			}
 
 			if len(schemaissue) > 0 {
 
 				schemaissue = removeColumnIssue(schemaissue)
 
-				if sessionState.Conv.Issues[table][column] == nil {
+				if sessionState.Conv.SchemaIssues[tableId].ColumnLevelIssues[columnId] == nil {
 
 					s := map[string][]internal.SchemaIssue{
-						column: schemaissue,
+						columnId: schemaissue,
 					}
-					sessionState.Conv.Issues = map[string]map[string][]internal.SchemaIssue{}
+					sessionState.Conv.SchemaIssues = map[string]internal.TableIssues{}
 
-					sessionState.Conv.Issues[table] = s
+					sessionState.Conv.SchemaIssues[tableId] = internal.TableIssues{
+						ColumnLevelIssues: s,
+					}
 
 				} else {
 
-					sessionState.Conv.Issues[table][column] = schemaissue
+					sessionState.Conv.SchemaIssues[tableId].ColumnLevelIssues[columnId] = schemaissue
 
 				}
 			}

@@ -65,7 +65,10 @@ export enum MigrationDetails {
   HasForeignKeyUpdateStarted = 'hasForeignKeyUpdateStarted',
   ForeignKeyProgressMessage = 'foreignKeyProgressMessage',
   ForeignKeyUpdateProgress = 'foreignKeyUpdateProgress',
-  GeneratingResources = 'generatingResources'
+  GeneratingResources = 'generatingResources',
+  NumberOfShards = 'numberOfShards',
+  NumberOfInstances = 'numberOfInstances',
+  isForeignKeySkipped = 'isForeignKeySkipped'
 }
 
 export enum TargetDetails {
@@ -84,6 +87,11 @@ export const Profile = {
   ExistingConnProfile: 'existing',
 }
 
+export const Dialect = {
+  PostgreSQLDialect: 'postgresql',
+  GoogleStandardSQLDialect: 'google_standard_sql'
+}
+
 export enum ProgressStatus {
 	SchemaMigrationComplete = 1,
 	SchemaCreationInProgress = 2,
@@ -91,4 +99,33 @@ export enum ProgressStatus {
 	DataWriteInProgress = 4,
 	ForeignKeyUpdateInProgress = 5,
   ForeignKeyUpdateComplete = 6
+}
+
+export const DialectList = [
+  { value: 'google_standard_sql', displayName: 'Google Standard SQL Dialect' },
+  { value: 'postgresql', displayName: 'PostgreSQL Dialect' },
+]
+
+export const Dataflow = {
+  Network: 'network',
+  Subnetwork: 'subnetwork',
+  HostProjectId: 'hostProjectId',
+  IsDataflowConfigSet: 'isDataflowConfigSet',
+}
+
+export const ColLength = {
+  StorageMaxLength: 9223372036854775807,
+  StringMaxLength: 2621440,
+  ByteMaxLength: 10485760,
+  DataTypes: ['STRING','BYTES','VARCHAR']
+}
+
+export const DataTypes = {
+  GoogleStandardSQL : ['BOOL','BYTES','DATE','FLOAT64','INT64','STRING', 'TIMESTAMP', 'NUMERIC', 'JSON'],
+  PostgreSQL : ['BOOL','BYTEA','DATE','FLOAT8','INT8','VARCHAR', 'TIMESTAMPTZ', 'NUMERIC', 'JSONB']
+}
+
+export enum PersistedFormValues {
+    DirectConnectForm = 'directConnectForm',
+    IsConnectionSuccessful = 'isConnectionSuccessful'
 }

@@ -21,7 +21,7 @@ on:
   pull_request:
 name: integration-tests-against-emulator
 jobs:
-  test:
+  integration-tests:
     runs-on: ubuntu-latest
     env:
       # set PostgreSQL related environment variables
@@ -51,7 +51,7 @@ jobs:
 
     services:
       spanner_emulator:
-        image: gcr.io/cloud-spanner-emulator/emulator:1.4.0
+        image: gcr.io/cloud-spanner-emulator/emulator:1.5.6
         ports:
           - 9010:9010
           - 9020:9020
@@ -66,7 +66,7 @@ jobs:
         # needed because the postgres container does not provide a healthcheck
         options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
       mariadb:
-        image: mariadb:10.3
+        image: mariadb:10.11
         env:
           MYSQL_ROOT_PASSWORD: root
           MYSQL_DATABASE: test
@@ -96,15 +96,13 @@ jobs:
           - 1521:1521
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       # init a PostgresSQL database from the test_data
       - name: Install PostgreSQL 12 client required for loading .sql files
         run: |
-          sudo bash -c "echo deb http://apt.postgresql.org/pub/repos/apt/ bionic-pgdg main >> /etc/apt/sources.list.d/pgdg.list"
-          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
           sudo apt-get update
-          sudo apt-get -yq install libpq-dev postgresql-client-12
+          sudo apt-get -yq install postgresql-client
       - run: psql --version
       - run: psql -f test_data/pg_dump.test.out
 
@@ -127,6 +125,7 @@ jobs:
       # sqlplus set up init oracle db.
       - name: Install sqlplus required for loading .sql files
         run: |
+          sudo apt-get update
           sudo apt install alien libaio1
           curl -O https://download.oracle.com/otn_software/linux/instantclient/215000/oracle-instantclient-basic-21.5.0.0.0-1.x86_64.rpm          
           curl -O https://download.oracle.com/otn_software/linux/instantclient/215000/oracle-instantclient-sqlplus-21.5.0.0.0-1.x86_64.rpm
@@ -152,7 +151,7 @@ jobs:
       # run tests
       - uses: actions/setup-go@v2
         with:
-          go-version: "1.16"
+          go-version: "1.19"
       - run: go version
       - run: go test -v ./...
         env:

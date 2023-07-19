@@ -82,7 +82,7 @@ func (cmd *DataCmd) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&cmd.filePrefix, "prefix", "", "File prefix for generated files")
 	f.Int64Var(&cmd.WriteLimit, "write-limit", DefaultWritersLimit, "Write limit for writes to spanner")
 	f.BoolVar(&cmd.dryRun, "dry-run", false, "Flag for generating DDL and schema conversion report without creating a spanner database")
-	f.StringVar(&cmd.logLevel, "log-level", "INFO", "Configure the logging level for the command (INFO, DEBUG), defaults to INFO")
+	f.StringVar(&cmd.logLevel, "log-level", "DEBUG", "Configure the logging level for the command (INFO, DEBUG), defaults to DEBUG")
 	f.BoolVar(&cmd.SkipForeignKeys, "skip-foreign-keys", false, "Skip creating foreign keys after data migration is complete (ddl statements for foreign keys can still be found in the downloaded schema.ddl.txt file and the same can be applied separately)")
 }
 
@@ -115,6 +115,7 @@ func (cmd *DataCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...interface
 	// Populate migration request id and migration type in conv object.
 	conv.Audit.MigrationRequestId = "HB-" + uuid.New().String()
 	conv.Audit.MigrationType = migration.MigrationData_DATA_ONLY.Enum()
+	conv.Audit.SkipMetricsPopulation = os.Getenv("SKIP_METRICS_POPULATION") == "true"
 	dataCoversionStartTime := time.Now()
 
 	if !sourceProfile.UseTargetSchema() {
@@ -122,8 +123,8 @@ func (cmd *DataCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...interface
 		if err != nil {
 			return subcommands.ExitUsageError
 		}
-		if targetProfile.TargetDb != "" && conv.TargetDb != targetProfile.TargetDb {
-			err = fmt.Errorf("running data migration for Spanner dialect: %v, whereas schema mapping was done for dialect: %v", targetProfile.TargetDb, conv.TargetDb)
+		if targetProfile.Conn.Sp.Dialect != "" && conv.SpDialect != targetProfile.Conn.Sp.Dialect {
+			err = fmt.Errorf("running data migration for Spanner dialect: %v, whereas schema mapping was done for dialect: %v", targetProfile.Conn.Sp.Dialect, conv.SpDialect)
 			return subcommands.ExitUsageError
 		}
 	}
@@ -154,9 +155,9 @@ func (cmd *DataCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...interface
 
 	// If filePrefix not explicitly set, use dbName as prefix.
 	if cmd.filePrefix == "" {
-		cmd.filePrefix = targetProfile.Conn.Sp.Dbname + "."
+		cmd.filePrefix = targetProfile.Conn.Sp.Dbname
 	}
-	conversion.Report(sourceProfile.Driver, bw.DroppedRowsByTable(), ioHelper.BytesRead, banner, conv, cmd.filePrefix+reportFile, ioHelper.Out)
+	conversion.Report(sourceProfile.Driver, bw.DroppedRowsByTable(), ioHelper.BytesRead, banner, conv, cmd.filePrefix, dbName, ioHelper.Out)
 	conversion.WriteBadData(bw, conv, banner, cmd.filePrefix+badDataFile, ioHelper.Out)
 	// Cleanup hb tmp data directory.
 	os.RemoveAll(filepath.Join(os.TempDir(), constants.HB_TMP_DIR))
@@ -164,7 +165,7 @@ func (cmd *DataCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...interface
 }
 
 // validateExistingDb validates that the existing spanner schema is in accordance with the one specified in the session file.
-func validateExistingDb(ctx context.Context, targetDb, dbURI string, adminClient *database.DatabaseAdminClient, client *sp.Client, conv *internal.Conv) error {
+func validateExistingDb(ctx context.Context, spDialect, dbURI string, adminClient *database.DatabaseAdminClient, client *sp.Client, conv *internal.Conv) error {
 	dbExists, err := conversion.CheckExistingDb(ctx, adminClient, dbURI)
 	if err != nil {
 		err = fmt.Errorf("can't verify target database: %v", err)
@@ -174,13 +175,17 @@ func validateExistingDb(ctx context.Context, targetDb, dbURI string, adminClient
 		err = fmt.Errorf("target database doesn't exist")
 		return err
 	}
-	err = conversion.ValidateTables(ctx, client, targetDb)
+	var nonEmptyTableName string
+	nonEmptyTableName, err = conversion.ValidateTables(ctx, client, spDialect)
 	if err != nil {
 		err = fmt.Errorf("error validating the tables: %v", err)
 		return err
 	}
+	if nonEmptyTableName != "" {
+		fmt.Printf("WARNING: Some tables in the database are non-empty e.g %s, overwriting these tables can lead to unintended behaviour. If this is unintended, please reconsider your migration attempt.\n\n", nonEmptyTableName)
+	}
 	spannerConv := internal.MakeConv()
-	spannerConv.TargetDb = targetDb
+	spannerConv.SpDialect = spDialect
 	err = utils.ReadSpannerSchema(ctx, spannerConv, client)
 	if err != nil {
 		err = fmt.Errorf("can't read spanner schema: %v", err)

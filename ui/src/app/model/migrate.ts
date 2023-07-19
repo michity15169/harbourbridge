@@ -1,9 +1,13 @@
+import { IDataflowConfig } from "./profile";
 import ITargetDetails from "./target-details";
 
 export default interface IMigrationDetails {
     TargetDetails: ITargetDetails
+    DataflowConfig: IDataflowConfig
     MigrationType: string
     MigrationMode: string
+    IsSharded: boolean
+    skipForeignKeys: boolean
 }
 
 export interface IProgress {
@@ -21,6 +25,13 @@ export interface IGeneratedResources {
     DataStreamJobUrl: string
     DataflowJobName: string
     DataflowJobUrl: string
+    ShardToDatastreamMap: Map<string, ResourceDetails>
+    ShardToDataflowMap: Map<string, ResourceDetails>
+}
+
+export interface ResourceDetails {
+    JobName: string
+    JobUrl: string
 }
 
 export interface ISourceAndTargetDetails {
@@ -28,4 +39,14 @@ export interface ISourceAndTargetDetails {
     SpannerDatabaseUrl: string
     SourceDatabaseName: string
     SourceDatabaseType: string
+}
+
+export interface ITables {
+    TableList: string[]
+}
+
+export interface ITableState {
+    TableName: string
+    TableId: string
+    isDeleted: boolean
 }

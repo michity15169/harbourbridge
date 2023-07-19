@@ -28,7 +28,16 @@ import (
 	"github.com/cloudspannerecosystem/harbourbridge/spanner/writer"
 )
 
-const completionPercentage = 100
+var (
+	badDataFile = ".dropped.txt"
+	schemaFile  = ".schema.txt"
+	sessionFile = ".session.json"
+)
+
+const (
+	DefaultWritersLimit  = 40
+	completionPercentage = 100
+)
 
 // CreateDatabaseClient creates new database client and admin client.
 func CreateDatabaseClient(ctx context.Context, targetProfile profiles.TargetProfile, driver, dbName string, ioHelper utils.IOStreams) (*database.DatabaseAdminClient, *sp.Client, string, error) {
@@ -63,7 +72,6 @@ func PrepareMigrationPrerequisites(sourceProfileString, targetProfileString, sou
 	if err != nil {
 		return profiles.SourceProfile{}, profiles.TargetProfile{}, utils.IOStreams{}, "", err
 	}
-	targetProfile.TargetDb = targetProfile.ToLegacyTargetDb()
 
 	sourceProfile, err := profiles.NewSourceProfile(sourceProfileString, source)
 	if err != nil {
@@ -126,7 +134,7 @@ func MigrateDatabase(ctx context.Context, targetProfile profiles.TargetProfile, 
 
 func migrateSchema(ctx context.Context, targetProfile profiles.TargetProfile, sourceProfile profiles.SourceProfile,
 	ioHelper *utils.IOStreams, conv *internal.Conv, dbURI string, adminClient *database.DatabaseAdminClient) error {
-	err := conversion.CreateOrUpdateDatabase(ctx, adminClient, dbURI, sourceProfile.Driver, targetProfile.TargetDb, conv, ioHelper.Out)
+	err := conversion.CreateOrUpdateDatabase(ctx, adminClient, dbURI, sourceProfile.Driver, conv, ioHelper.Out, sourceProfile.Config.ConfigType)
 	if err != nil {
 		err = fmt.Errorf("can't create/update database: %v", err)
 		return err
@@ -142,7 +150,7 @@ func migrateData(ctx context.Context, targetProfile profiles.TargetProfile, sour
 		err error
 	)
 	if !sourceProfile.UseTargetSchema() {
-		err = validateExistingDb(ctx, conv.TargetDb, dbURI, adminClient, client, conv)
+		err = validateExistingDb(ctx, conv.SpDialect, dbURI, adminClient, client, conv)
 		if err != nil {
 			err = fmt.Errorf("error while validating existing database: %v", err)
 			return nil, err
@@ -155,7 +163,7 @@ func migrateData(ctx context.Context, targetProfile profiles.TargetProfile, sour
 	}
 	conv.Audit.Progress.UpdateProgress("Data migration complete.", completionPercentage, internal.DataMigrationComplete)
 	if !cmd.SkipForeignKeys {
-		if err = conversion.UpdateDDLForeignKeys(ctx, adminClient, dbURI, conv, ioHelper.Out); err != nil {
+		if err = conversion.UpdateDDLForeignKeys(ctx, adminClient, dbURI, conv, ioHelper.Out, sourceProfile.Driver, sourceProfile.Config.ConfigType); err != nil {
 			err = fmt.Errorf("can't perform update schema on db %s with foreign keys: %v", dbURI, err)
 			return bw, err
 		}
@@ -165,7 +173,7 @@ func migrateData(ctx context.Context, targetProfile profiles.TargetProfile, sour
 
 func migrateSchemaAndData(ctx context.Context, targetProfile profiles.TargetProfile, sourceProfile profiles.SourceProfile,
 	ioHelper *utils.IOStreams, conv *internal.Conv, dbURI string, adminClient *database.DatabaseAdminClient, client *sp.Client, cmd *SchemaAndDataCmd) (*writer.BatchWriter, error) {
-	err := conversion.CreateOrUpdateDatabase(ctx, adminClient, dbURI, sourceProfile.Driver, targetProfile.TargetDb, conv, ioHelper.Out)
+	err := conversion.CreateOrUpdateDatabase(ctx, adminClient, dbURI, sourceProfile.Driver, conv, ioHelper.Out, sourceProfile.Config.ConfigType)
 	if err != nil {
 		err = fmt.Errorf("can't create/update database: %v", err)
 		return nil, err
@@ -179,7 +187,7 @@ func migrateSchemaAndData(ctx context.Context, targetProfile profiles.TargetProf
 
 	conv.Audit.Progress.UpdateProgress("Data migration complete.", completionPercentage, internal.DataMigrationComplete)
 	if !cmd.SkipForeignKeys {
-		if err = conversion.UpdateDDLForeignKeys(ctx, adminClient, dbURI, conv, ioHelper.Out); err != nil {
+		if err = conversion.UpdateDDLForeignKeys(ctx, adminClient, dbURI, conv, ioHelper.Out, sourceProfile.Driver, sourceProfile.Config.ConfigType); err != nil {
 			err = fmt.Errorf("can't perform update schema on db %s with foreign keys: %v", dbURI, err)
 			return bw, err
 		}

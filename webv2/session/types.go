@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/cloudspannerecosystem/harbourbridge/internal"
+	"github.com/cloudspannerecosystem/harbourbridge/profiles"
 )
 
 type SchemaConversionSession struct {
@@ -21,6 +22,7 @@ type SessionMetadata struct {
 	EditorName   string
 	DatabaseType string
 	DatabaseName string
+	Dialect      string
 	Notes        []string
 	Tags         []string
 }
@@ -50,6 +52,11 @@ type SessionState struct {
 	IsOffline           bool                // True if the connection to remote metadata database is invalid
 	GCPProjectID        string
 	SpannerInstanceID   string
+	Dialect             string
+	IsSharded 			bool
+	TmpDir string
+	ShardedDbConnDetails []profiles.DirectConnectionConfig
+	SourceProfileConfig profiles.SourceProfileConfig
 	Region              string
 	SpannerDatabaseName string
 	Bucket              string

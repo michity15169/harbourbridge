@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
 	"github.com/cloudspannerecosystem/harbourbridge/conversion"
 	"github.com/cloudspannerecosystem/harbourbridge/internal"
 	"github.com/cloudspannerecosystem/harbourbridge/logger"
@@ -106,36 +107,39 @@ func BuildConv(t *testing.T, numCols, numFks int, makeEmpty bool) *internal.Conv
 	if makeEmpty {
 		return conv
 	}
-	colNames := []string{}
+	colIds := []string{}
 	colDefs := map[string]ddl.ColumnDef{}
 	for i := 1; i <= numCols; i++ {
 		currColName := fmt.Sprintf("col%d", i)
-		colNames = append(colNames, currColName)
-		colDefs[currColName] = ddl.ColumnDef{Name: currColName, T: ddl.Type{Name: ddl.String, Len: int64(10)}}
+		currColId := fmt.Sprintf("c%d", i)
+		colIds = append(colIds, currColId)
+		colDefs[currColId] = ddl.ColumnDef{Name: currColName, T: ddl.Type{Name: ddl.String, Len: int64(10)}}
 	}
 
 	var foreignKeys []ddl.Foreignkey
 	for i := 1; i <= numFks; i++ {
 		foreignKey := ddl.Foreignkey{
-			Name:         fmt.Sprintf("fk_%d", i),
-			Columns:      []string{fmt.Sprintf("col%d", i)},
-			ReferTable:   "table_b",
-			ReferColumns: []string{fmt.Sprintf("col%d", i)}}
+			Name:           fmt.Sprintf("fk_%d", i),
+			ColIds:         []string{fmt.Sprintf("c%d", i)},
+			ReferTableId:   "t2",
+			ReferColumnIds: []string{fmt.Sprintf("c%d", i)}}
 		foreignKeys = append(foreignKeys, foreignKey)
 	}
 
-	conv.SpSchema["table_a"] = ddl.CreateTable{
-		Name:     "table_a",
-		ColNames: colNames,
-		ColDefs:  colDefs,
-		Pks:      []ddl.IndexKey{ddl.IndexKey{Col: "col1"}},
-		Fks:      foreignKeys,
+	conv.SpSchema["t1"] = ddl.CreateTable{
+		Name:        "table_a",
+		ColIds:      colIds,
+		ColDefs:     colDefs,
+		PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "c1"}},
+		ForeignKeys: foreignKeys,
+		Id:          "t1",
 	}
-	conv.SpSchema["table_b"] = ddl.CreateTable{
-		Name:     "table_b",
-		ColNames: colNames,
-		ColDefs:  colDefs,
-		Pks:      []ddl.IndexKey{ddl.IndexKey{Col: "col1"}},
+	conv.SpSchema["t2"] = ddl.CreateTable{
+		Name:        "table_b",
+		ColIds:      colIds,
+		ColDefs:     colDefs,
+		PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "c1"}},
+		Id:          "t2",
 	}
 	return conv
 }
@@ -192,12 +196,12 @@ func TestUpdateDDLForeignKeys(t *testing.T) {
 	for _, tc := range testCases {
 		dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, tc.dbName)
 		conv := BuildConv(t, tc.numCols, tc.numFks, false)
-		err := conversion.CreateDatabase(ctx, databaseAdmin, dbURI, conv, os.Stdout)
+		err := conversion.CreateDatabase(ctx, databaseAdmin, dbURI, conv, os.Stdout, "", constants.BULK_MIGRATION)
 		if err != nil {
 			t.Fatal(err)
 		}
 		conversion.MaxWorkers = tc.numWorkers
-		if err = conversion.UpdateDDLForeignKeys(ctx, databaseAdmin, dbURI, conv, os.Stdout); err != nil {
+		if err = conversion.UpdateDDLForeignKeys(ctx, databaseAdmin, dbURI, conv, os.Stdout, "", constants.BULK_MIGRATION); err != nil {
 			t.Fatalf("\nCan't perform update operation on db %s with foreign keys: %v\n", tc.dbName, err)
 		}
 
@@ -223,7 +227,7 @@ func TestVerifyDb(t *testing.T) {
 	for _, tc := range testCases {
 		dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, tc.dbName)
 		if tc.dbExists {
-			err := conversion.CreateDatabase(ctx, databaseAdmin, dbURI, BuildConv(t, 2, 0, tc.emptySchema), os.Stdout)
+			err := conversion.CreateDatabase(ctx, databaseAdmin, dbURI, BuildConv(t, 2, 0, tc.emptySchema), os.Stdout, "", constants.BULK_MIGRATION)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -247,7 +251,7 @@ func TestVerifyDb(t *testing.T) {
 func TestCheckExistingDb(t *testing.T) {
 	onlyRunForEmulatorTest(t)
 	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, "check-db-exists")
-	err := conversion.CreateDatabase(ctx, databaseAdmin, dbURI, internal.MakeConv(), os.Stdout)
+	err := conversion.CreateDatabase(ctx, databaseAdmin, dbURI, internal.MakeConv(), os.Stdout, "", constants.BULK_MIGRATION)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +284,7 @@ func TestValidateDDL(t *testing.T) {
 
 	for _, tc := range testCases {
 		dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, tc.dbName)
-		err := conversion.CreateDatabase(ctx, databaseAdmin, dbURI, BuildConv(t, 2, 0, tc.emptySchema), os.Stdout)
+		err := conversion.CreateDatabase(ctx, databaseAdmin, dbURI, BuildConv(t, 2, 0, tc.emptySchema), os.Stdout, "", constants.BULK_MIGRATION)
 		if err != nil {
 			t.Fatal(err)
 		}

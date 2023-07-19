@@ -57,13 +57,21 @@
                 </li>
                 <div *ngIf="!testSuccess && errorMsg != ''" class="failure">
                     <span class="left-text">Test connection failed</span>
-                    <mat-icon class="icon error" matTooltip="Test connection failed" matTooltipPosition="above">
+                    <mat-icon class="icon error" [matTooltip]="errorMsg" matTooltipPosition="above">
                         error
                     </mat-icon>
                 </div>
                 <br>
+                <div *ngIf="testingSourceConnection">
+                    <br>
+                    <span class="spinner">
+                        <mat-spinner [diameter]="20">
+                        </mat-spinner>
+                    </span>
+                    <span class="spinner-small-text">Testing Connection</span><br>
+                </div>
                 <button mat-raised-button type="submit" color="primary" (click)="testConnection()"
-                    [disabled]="!(connectionProfileForm.valid)">Test Connection</button>
+                    [disabled]="!(connectionProfileForm.valid) || testingSourceConnection">Test Connection</button>
                 <mat-icon *ngIf="testSuccess" class="success" matTooltip="Test connection successful"
                     matTooltipPosition="above">
                     check_circle

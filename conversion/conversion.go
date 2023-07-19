@@ -49,6 +49,7 @@ import (
 	"github.com/cloudspannerecosystem/harbourbridge/common/metrics"
 	"github.com/cloudspannerecosystem/harbourbridge/common/utils"
 	"github.com/cloudspannerecosystem/harbourbridge/internal"
+	"github.com/cloudspannerecosystem/harbourbridge/internal/reports"
 	"github.com/cloudspannerecosystem/harbourbridge/logger"
 	"github.com/cloudspannerecosystem/harbourbridge/profiles"
 	"github.com/cloudspannerecosystem/harbourbridge/sources/common"
@@ -61,6 +62,7 @@ import (
 	"github.com/cloudspannerecosystem/harbourbridge/sources/sqlserver"
 	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
 	"github.com/cloudspannerecosystem/harbourbridge/spanner/writer"
+	"github.com/cloudspannerecosystem/harbourbridge/streaming"
 	"go.uber.org/zap"
 	adminpb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
 	"google.golang.org/grpc/metadata"
@@ -72,7 +74,7 @@ var (
 	// This number should not be too high so as to not hit the AdminQuota limit.
 	// AdminQuota limits are mentioned here: https://cloud.google.com/spanner/quotas#administrative_limits
 	// If facing a quota limit error, consider reducing this value.
-	MaxWorkers = 20
+	MaxWorkers = 50
 )
 
 // SchemaConv performs the schema conversion
@@ -82,7 +84,7 @@ func SchemaConv(sourceProfile profiles.SourceProfile, targetProfile profiles.Tar
 	case constants.POSTGRES, constants.MYSQL, constants.DYNAMODB, constants.SQLSERVER, constants.ORACLE:
 		return schemaFromDatabase(sourceProfile, targetProfile)
 	case constants.PGDUMP, constants.MYSQLDUMP:
-		return schemaFromDump(sourceProfile.Driver, targetProfile.TargetDb, ioHelper)
+		return schemaFromDump(sourceProfile.Driver, targetProfile.Conn.Sp.Dialect, ioHelper)
 	default:
 		return nil, fmt.Errorf("schema conversion for driver %s not supported", sourceProfile.Driver)
 	}
@@ -165,24 +167,82 @@ func getDbNameFromSQLConnectionStr(driver, sqlConnectionStr string) string {
 	return ""
 }
 
-func schemaFromDatabase(sourceProfile profiles.SourceProfile, targetProfile profiles.TargetProfile) (*internal.Conv, error) {
-	conv := internal.MakeConv()
-	conv.TargetDb = targetProfile.TargetDb
-	infoSchema, err := GetInfoSchema(sourceProfile, targetProfile)
+func getInfoSchemaForShard(shardConnInfo profiles.DirectConnectionConfig, driver string, targetProfile profiles.TargetProfile) (common.InfoSchema, error) {
+	params := make(map[string]string)
+	params["host"] = shardConnInfo.Host
+	params["user"] = shardConnInfo.User
+	params["dbName"] = shardConnInfo.DbName
+	params["port"] = shardConnInfo.Port
+	params["password"] = shardConnInfo.Password
+	//while adding other sources, a switch-case will be added here on the basis of the driver input param passed.
+	//pased on the driver name, profiles.NewSourceProfileConnection<DBName> will need to be called to create
+	//the source profile information.
+	sourceProfileConnectionMySQL, err := profiles.NewSourceProfileConnectionMySQL(params)
 	if err != nil {
-		return conv, err
+		return nil, fmt.Errorf("cannot parse connection configuration for the primary shard")
 	}
-	return conv, common.ProcessSchema(conv, infoSchema)
+	sourceProfileConnection := profiles.SourceProfileConnection{Mysql: sourceProfileConnectionMySQL, Ty: profiles.SourceProfileConnectionTypeMySQL}
+	//create a source profile which contains the sourceProfileConnection object for the primary shard
+	//this is done because GetSQLConnectionStr() should not be aware of sharding
+	newSourceProfile := profiles.SourceProfile{Conn: sourceProfileConnection, Ty: profiles.SourceProfileTypeConnection}
+	newSourceProfile.Driver = driver
+	infoSchema, err := GetInfoSchema(newSourceProfile, targetProfile)
+	if err != nil {
+		return nil, err
+	}
+	return infoSchema, nil
 }
 
-func performSnapshotMigration(config writer.BatchWriterConfig, conv *internal.Conv, client *sp.Client, infoSchema common.InfoSchema) *writer.BatchWriter {
+func schemaFromDatabase(sourceProfile profiles.SourceProfile, targetProfile profiles.TargetProfile) (*internal.Conv, error) {
+	conv := internal.MakeConv()
+	conv.SpDialect = targetProfile.Conn.Sp.Dialect
+	//handle fetching schema differently for sharded migrations, we only connect to the primary shard to
+	//fetch the schema. We reuse the SourceProfileConnection object for this purpose.
+	var infoSchema common.InfoSchema
+	var err error
+	isSharded := false
+	switch sourceProfile.Ty {
+	case profiles.SourceProfileTypeConfig:
+		isSharded = true
+		//Find Primary Shard Name
+		if sourceProfile.Config.ConfigType == constants.BULK_MIGRATION {
+			schemaSource := sourceProfile.Config.ShardConfigurationBulk.SchemaSource
+			infoSchema, err = getInfoSchemaForShard(schemaSource, sourceProfile.Driver, targetProfile)
+			if err != nil {
+				return conv, err
+			}
+		} else if sourceProfile.Config.ConfigType == constants.DATAFLOW_MIGRATION {
+			schemaSource := sourceProfile.Config.ShardConfigurationDataflow.SchemaSource
+			infoSchema, err = getInfoSchemaForShard(schemaSource, sourceProfile.Driver, targetProfile)
+			if err != nil {
+				return conv, err
+			}
+		} else if sourceProfile.Config.ConfigType == constants.DMS_MIGRATION {
+			// TODO: Define the schema processing logic for DMS migrations here.
+			return conv, fmt.Errorf("dms based migrations are not implemented yet")
+		} else {
+			return conv, fmt.Errorf("unknown type of migration, please select one of bulk, dataflow or dms")
+		}
+	default:
+		infoSchema, err = GetInfoSchema(sourceProfile, targetProfile)
+		if err != nil {
+			return conv, err
+		}
+	}
+	additionalSchemaAttributes := internal.AdditionalSchemaAttributes{
+		IsSharded: isSharded,
+	}
+	return conv, common.ProcessSchema(conv, infoSchema, common.DefaultWorkers, additionalSchemaAttributes)
+}
+
+func performSnapshotMigration(config writer.BatchWriterConfig, conv *internal.Conv, client *sp.Client, infoSchema common.InfoSchema, additionalAttributes internal.AdditionalDataAttributes) *writer.BatchWriter {
 	common.SetRowStats(conv, infoSchema)
 	totalRows := conv.Rows()
 	if !conv.Audit.DryRun {
 		conv.Audit.Progress = *internal.NewProgress(totalRows, "Writing data to Spanner", internal.Verbose(), false, int(internal.DataWriteInProgress))
 	}
 	batchWriter := populateDataConv(conv, config, client)
-	common.ProcessData(conv, infoSchema)
+	common.ProcessData(conv, infoSchema, additionalAttributes)
 	batchWriter.Flush()
 	return batchWriter
 }
@@ -193,34 +253,128 @@ func snapshotMigrationHandler(sourceProfile profiles.SourceProfile, config write
 	case constants.MYSQL, constants.ORACLE, constants.POSTGRES:
 		return &writer.BatchWriter{}, nil
 	case constants.DYNAMODB:
-		return performSnapshotMigration(config, conv, client, infoSchema), nil
+		return performSnapshotMigration(config, conv, client, infoSchema, internal.AdditionalDataAttributes{ShardId: ""}), nil
 	default:
 		return &writer.BatchWriter{}, fmt.Errorf("streaming migration not supported for driver %s", sourceProfile.Driver)
 	}
 }
 
+func updateShardsWithDataflowConfig(shardedDataflowConfig profiles.ShardConfigurationDataflow) {
+	for _, dataShard := range shardedDataflowConfig.DataShards {
+		dataShard.DataflowConfig = shardedDataflowConfig.DataflowConfig
+	}
+}
+
 func dataFromDatabase(ctx context.Context, sourceProfile profiles.SourceProfile, targetProfile profiles.TargetProfile, config writer.BatchWriterConfig, conv *internal.Conv, client *sp.Client) (*writer.BatchWriter, error) {
-	infoSchema, err := GetInfoSchema(sourceProfile, targetProfile)
+	//handle migrating data for sharded migrations differently
+	//sharded migrations are identified via the config= flag, if that flag is not present
+	//carry on with the existing code path in the else block
+	switch sourceProfile.Ty {
+	case profiles.SourceProfileTypeConfig:
+		////There are three cases to cover here, bulk migrations and sharded migrations (and later DMS)
+		//We provide an if-else based handling for each within the sharded code branch
+		//This will be determined via the configType, which can be "bulk", "dataflow" or "dms"
+		if sourceProfile.Config.ConfigType == constants.BULK_MIGRATION {
+			return dataFromDatabaseForBulkMigration(sourceProfile, targetProfile, config, conv, client)
+		} else if sourceProfile.Config.ConfigType == constants.DATAFLOW_MIGRATION {
+			return dataFromDatabaseForDataflowMigration(targetProfile, ctx, sourceProfile, conv)
+		} else if sourceProfile.Config.ConfigType == constants.DMS_MIGRATION {
+			return dataFromDatabaseForDMSMigration()
+		} else {
+			return nil, fmt.Errorf("configType should be one of 'bulk', 'dataflow' or 'dms'")
+		}
+	default:
+		infoSchema, err := GetInfoSchema(sourceProfile, targetProfile)
+		if err != nil {
+			return nil, err
+		}
+		var streamInfo map[string]interface{}
+		if sourceProfile.Conn.Streaming {
+			streamInfo, err = infoSchema.StartChangeDataCapture(ctx, conv)
+			if err != nil {
+				return nil, err
+			}
+			bw, err := snapshotMigrationHandler(sourceProfile, config, conv, client, infoSchema)
+			if err != nil {
+				return nil, err
+			}
+			err = infoSchema.StartStreamingMigration(ctx, client, conv, streamInfo)
+			if err != nil {
+				return nil, err
+			}
+			return bw, nil
+		}
+		return performSnapshotMigration(config, conv, client, infoSchema, internal.AdditionalDataAttributes{ShardId: ""}), nil
+	}
+}
+
+// TODO: Define the data processing logic for DMS migrations here.
+func dataFromDatabaseForDMSMigration() (*writer.BatchWriter, error) {
+	return nil, fmt.Errorf("dms configType is not implemented yet, please use one of 'bulk' or 'dataflow'")
+}
+
+// 1. Create batch for each physical shard
+// 2. Create streaming cfg from the config source type.
+// 3. Verify the CFG and update it with HB defaults
+// 4. Launch the stream for the physical shard
+// 5. Perform streaming migration via dataflow
+func dataFromDatabaseForDataflowMigration(targetProfile profiles.TargetProfile, ctx context.Context, sourceProfile profiles.SourceProfile, conv *internal.Conv) (*writer.BatchWriter, error) {
+	updateShardsWithDataflowConfig(sourceProfile.Config.ShardConfigurationDataflow)
+	conv.Audit.StreamingStats.ShardToDataStreamNameMap = make(map[string]string)
+	conv.Audit.StreamingStats.ShardToDataflowJobMap = make(map[string]string)
+	tableList, err := common.GetIncludedSrcTablesFromConv(conv)
 	if err != nil {
-		return nil, err
+		fmt.Printf("unable to determine tableList from schema, falling back to full database")
+		tableList = []string{}
 	}
-	var streamInfo map[string]interface{}
-	if sourceProfile.Conn.Streaming {
-		streamInfo, err = infoSchema.StartChangeDataCapture(ctx, conv)
-		if err != nil {
-			return nil, err
+	asyncProcessShards := func(p *profiles.DataShard, mutex *sync.Mutex) common.TaskResult[*profiles.DataShard] {
+		dbNameToShardIdMap := make(map[string]string)
+		for _, l := range p.LogicalShards {
+			dbNameToShardIdMap[l.DbName] = l.LogicalShardId
 		}
-		bw, err := snapshotMigrationHandler(sourceProfile, config, conv, client, infoSchema)
+		streamingCfg := streaming.CreateStreamingConfig(*p)
+		err := streaming.VerifyAndUpdateCfg(&streamingCfg, targetProfile.Conn.Sp.Dbname, tableList)
 		if err != nil {
-			return nil, err
+			err = fmt.Errorf("failed to process shard: %s, there seems to be an error in the sharding configuration, error: %v", p.DataShardId, err)
+			return common.TaskResult[*profiles.DataShard]{Result: p, Err: err}
 		}
-		err = infoSchema.StartStreamingMigration(ctx, client, conv, streamInfo)
+		fmt.Printf("Initiating migration for shard: %v\n", p.DataShardId)
+
+		err = streaming.LaunchStream(ctx, sourceProfile, p.LogicalShards, targetProfile.Conn.Sp.Project, streamingCfg.DatastreamCfg)
 		if err != nil {
-			return nil, err
+			return common.TaskResult[*profiles.DataShard]{Result: p, Err: err}
 		}
-		return bw, nil
+		streamingCfg.DataflowCfg.DbNameToShardIdMap = dbNameToShardIdMap
+		err = streaming.StartDataflow(ctx, targetProfile, streamingCfg, conv)
+		return common.TaskResult[*profiles.DataShard]{Result: p, Err: err}
 	}
-	return performSnapshotMigration(config, conv, client, infoSchema), nil
+	_, err = common.RunParallelTasks(sourceProfile.Config.ShardConfigurationDataflow.DataShards, 5, asyncProcessShards, true)
+	if err != nil {
+		return nil, fmt.Errorf("unable to start minimal downtime migrations: %v", err)
+	}
+	return &writer.BatchWriter{}, nil
+}
+
+// 1. Migrate the data from the data shards, the schema shard needs to be specified here again.
+// 2. Create a connection profile object for it
+// 3. Perform a snapshot migration for the shard
+// 4. Once all shard migrations are complete, return the batch writer object
+func dataFromDatabaseForBulkMigration(sourceProfile profiles.SourceProfile, targetProfile profiles.TargetProfile, config writer.BatchWriterConfig, conv *internal.Conv, client *sp.Client) (*writer.BatchWriter, error) {
+	var bw *writer.BatchWriter
+	for _, dataShard := range sourceProfile.Config.ShardConfigurationBulk.DataShards {
+
+		fmt.Printf("Initiating migration for shard: %v\n", dataShard.DbName)
+		infoSchema, err := getInfoSchemaForShard(dataShard, sourceProfile.Driver, targetProfile)
+		if err != nil {
+			return nil, err
+		}
+		additionalDataAttributes := internal.AdditionalDataAttributes{
+			ShardId: dataShard.DataShardId,
+		}
+		bw = performSnapshotMigration(config, conv, client, infoSchema, additionalDataAttributes)
+	}
+
+	return bw, nil
 }
 
 func getDynamoDBClientConfig() (*aws.Config, error) {
@@ -232,7 +386,7 @@ func getDynamoDBClientConfig() (*aws.Config, error) {
 	return &cfg, nil
 }
 
-func schemaFromDump(driver string, targetDb string, ioHelper *utils.IOStreams) (*internal.Conv, error) {
+func schemaFromDump(driver string, spDialect string, ioHelper *utils.IOStreams) (*internal.Conv, error) {
 	f, n, err := getSeekable(ioHelper.In)
 	if err != nil {
 		utils.PrintSeekError(driver, err, ioHelper.Out)
@@ -241,7 +395,7 @@ func schemaFromDump(driver string, targetDb string, ioHelper *utils.IOStreams) (
 	ioHelper.SeekableIn = f
 	ioHelper.BytesRead = n
 	conv := internal.MakeConv()
-	conv.TargetDb = targetDb
+	conv.SpDialect = spDialect
 	p := internal.NewProgress(n, "Generating schema", internal.Verbose(), false, int(internal.SchemaCreationInProgress))
 	r := internal.NewReader(bufio.NewReader(f), p)
 	conv.SetSchemaMode() // Build schema and ignore data in dump.
@@ -291,13 +445,16 @@ func dataFromCSV(ctx context.Context, sourceProfile profiles.SourceProfile, targ
 	if targetProfile.Conn.Sp.Dbname == "" {
 		return nil, fmt.Errorf("dbName is mandatory in target-profile for csv source")
 	}
-	conv.TargetDb = targetProfile.ToLegacyTargetDb()
+	conv.SpDialect = targetProfile.Conn.Sp.Dialect
 	dialect, err := targetProfile.FetchTargetDialect(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("could not fetch dialect: %v", err)
 	}
+	if strings.ToLower(dialect) != constants.DIALECT_POSTGRESQL {
+		dialect = constants.DIALECT_GOOGLESQL
+	}
 
-	if utils.DialectToTarget(dialect) != conv.TargetDb {
+	if dialect != conv.SpDialect {
 		return nil, fmt.Errorf("dialect specified in target profile does not match spanner dialect")
 	}
 
@@ -339,10 +496,14 @@ func dataFromCSV(ctx context.Context, sourceProfile profiles.SourceProfile, targ
 func populateDataConv(conv *internal.Conv, config writer.BatchWriterConfig, client *sp.Client) *writer.BatchWriter {
 	rows := int64(0)
 	config.Write = func(m []*sp.Mutation) error {
-		migrationData := metrics.GetMigrationData(conv, "", "", constants.DataConv)
-		serializedMigrationData, _ := proto.Marshal(migrationData)
-		migrationMetadataValue := base64.StdEncoding.EncodeToString(serializedMigrationData)
-		_, err := client.Apply(metadata.AppendToOutgoingContext(context.Background(), constants.MigrationMetadataKey, migrationMetadataValue), m)
+		ctx := context.Background()
+		if !conv.Audit.SkipMetricsPopulation {
+			migrationData := metrics.GetMigrationData(conv, "", constants.DataConv)
+			serializedMigrationData, _ := proto.Marshal(migrationData)
+			migrationMetadataValue := base64.StdEncoding.EncodeToString(serializedMigrationData)
+			ctx = metadata.AppendToOutgoingContext(context.Background(), constants.MigrationMetadataKey, migrationMetadataValue)
+		}
+		_, err := client.Apply(ctx, m)
 		if err != nil {
 			return err
 		}
@@ -366,8 +527,25 @@ func populateDataConv(conv *internal.Conv, config writer.BatchWriterConfig, clie
 }
 
 // Report generates a report of schema and data conversion.
-func Report(driver string, badWrites map[string]int64, BytesRead int64, banner string, conv *internal.Conv, reportFileName string, out *os.File) {
-	f, err := os.Create(reportFileName)
+func Report(driver string, badWrites map[string]int64, BytesRead int64, banner string, conv *internal.Conv, reportFileName string, dbName string, out *os.File) {
+
+	//Write the structured report file
+	structuredReportFileName := fmt.Sprintf("%s.%s", reportFileName, "structured_report.json")
+	structuredReport := reports.GenerateStructuredReport(driver, dbName, conv, badWrites, true, true)
+	fBytes, _ := json.MarshalIndent(structuredReport, "", " ")
+	f, err := os.Create(structuredReportFileName)
+	if err != nil {
+		fmt.Fprintf(out, "Can't write out structured report file %s: %v\n", reportFileName, err)
+		fmt.Fprintf(out, "Writing report to stdout\n")
+		f = out
+	} else {
+		defer f.Close()
+	}
+	f.Write(fBytes)
+
+	//Write the text report file from the structured report
+	textReportFileName := fmt.Sprintf("%s.%s", reportFileName, "report.txt")
+	f, err = os.Create(textReportFileName)
 	if err != nil {
 		fmt.Fprintf(out, "Can't write out report file %s: %v\n", reportFileName, err)
 		fmt.Fprintf(out, "Writing report to stdout\n")
@@ -377,9 +555,9 @@ func Report(driver string, badWrites map[string]int64, BytesRead int64, banner s
 	}
 	w := bufio.NewWriter(f)
 	w.WriteString(banner)
-
-	summary := internal.GenerateReport(driver, conv, w, badWrites, true, true)
+	reports.GenerateTextReport(structuredReport, w)
 	w.Flush()
+
 	var isDump bool
 	if strings.Contains(driver, "dump") {
 		isDump = true
@@ -394,7 +572,7 @@ func Report(driver string, badWrites map[string]int64, BytesRead int64, banner s
 	// We've already written summary to f (as part of GenerateReport).
 	// In the case where f is stdout, don't write a duplicate copy.
 	if f != out {
-		fmt.Fprint(out, summary)
+		fmt.Fprint(out, structuredReport.Summary.Text)
 		fmt.Fprintf(out, "See file '%s' for details of the schema and data conversions.\n", reportFileName)
 	}
 }
@@ -469,22 +647,23 @@ func CheckExistingDb(ctx context.Context, adminClient *database.DatabaseAdminCli
 }
 
 // ValidateTables validates that all the tables in the database are empty.
-func ValidateTables(ctx context.Context, client *sp.Client, targetDb string) error {
-	infoSchema := spanner.InfoSchemaImpl{Client: client, Ctx: ctx, TargetDb: targetDb}
+// It returns the name of the first non-empty table if found, and an empty string otherwise.
+func ValidateTables(ctx context.Context, client *sp.Client, spDialect string) (string, error) {
+	infoSchema := spanner.InfoSchemaImpl{Client: client, Ctx: ctx, SpDialect: spDialect}
 	tables, err := infoSchema.GetTables()
 	if err != nil {
-		return err
+		return "", err
 	}
 	for _, table := range tables {
 		count, err := infoSchema.GetRowCount(table)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if count != 0 {
-			return fmt.Errorf("table %v should be empty for data migration to take place", table.Name)
+			return table.Name, nil
 		}
 	}
-	return nil
+	return "", nil
 }
 
 // ValidateDDL verifies if an existing DB's ddl follows what is supported by harbourbridge. Currently,
@@ -501,23 +680,28 @@ func ValidateDDL(ctx context.Context, adminClient *database.DatabaseAdminClient,
 }
 
 // CreatesOrUpdatesDatabase updates an existing Spanner database or creates a new one if one does not exist.
-func CreateOrUpdateDatabase(ctx context.Context, adminClient *database.DatabaseAdminClient, dbURI, driver, targetDb string, conv *internal.Conv, out *os.File) error {
+func CreateOrUpdateDatabase(ctx context.Context, adminClient *database.DatabaseAdminClient, dbURI, driver string, conv *internal.Conv, out *os.File, migrationType string) error {
 	dbExists, err := VerifyDb(ctx, adminClient, dbURI)
 	if err != nil {
 		return err
 	}
-	// Adding migration metadata to the outgoing context.
-	migrationData := metrics.GetMigrationData(conv, driver, targetDb, constants.SchemaConv)
-	serializedMigrationData, _ := proto.Marshal(migrationData)
-	migrationMetadataValue := base64.StdEncoding.EncodeToString(serializedMigrationData)
-	ctx = metadata.AppendToOutgoingContext(ctx, constants.MigrationMetadataKey, migrationMetadataValue)
+	if !conv.Audit.SkipMetricsPopulation {
+		// Adding migration metadata to the outgoing context.
+		migrationData := metrics.GetMigrationData(conv, driver, constants.SchemaConv)
+		serializedMigrationData, _ := proto.Marshal(migrationData)
+		migrationMetadataValue := base64.StdEncoding.EncodeToString(serializedMigrationData)
+		ctx = metadata.AppendToOutgoingContext(ctx, constants.MigrationMetadataKey, migrationMetadataValue)
+	}
 	if dbExists {
-		err := UpdateDatabase(ctx, adminClient, dbURI, conv, out)
+		if conv.SpDialect != constants.DIALECT_POSTGRESQL && migrationType == constants.DATAFLOW_MIGRATION {
+			return fmt.Errorf("Harbourbridge does not support minimal downtime schema/schema-and-data migrations to an existing database.")
+		}
+		err := UpdateDatabase(ctx, adminClient, dbURI, conv, out, driver)
 		if err != nil {
 			return fmt.Errorf("can't update database schema: %v", err)
 		}
 	} else {
-		err := CreateDatabase(ctx, adminClient, dbURI, conv, out)
+		err := CreateDatabase(ctx, adminClient, dbURI, conv, out, driver, migrationType)
 		if err != nil {
 			return fmt.Errorf("can't create database: %v", err)
 		}
@@ -529,7 +713,7 @@ func CreateOrUpdateDatabase(ctx context.Context, adminClient *database.DatabaseA
 // It automatically determines an appropriate project, selects a
 // Spanner instance to use, generates a new Spanner DB name,
 // and call into the Spanner admin interface to create the new DB.
-func CreateDatabase(ctx context.Context, adminClient *database.DatabaseAdminClient, dbURI string, conv *internal.Conv, out *os.File) error {
+func CreateDatabase(ctx context.Context, adminClient *database.DatabaseAdminClient, dbURI string, conv *internal.Conv, out *os.File, driver string, migrationType string) error {
 	project, instance, dbName := utils.ParseDbURI(dbURI)
 	fmt.Fprintf(out, "Creating new database %s in instance %s with default permissions ... \n", dbName, instance)
 	// The schema we send to Spanner excludes comments (since Cloud
@@ -539,8 +723,8 @@ func CreateDatabase(ctx context.Context, adminClient *database.DatabaseAdminClie
 	req := &adminpb.CreateDatabaseRequest{
 		Parent: fmt.Sprintf("projects/%s/instances/%s", project, instance),
 	}
-	if conv.TargetDb == constants.TargetExperimentalPostgres {
-		// TargetExperimentalPostgres doesn't support:
+	if conv.SpDialect == constants.DIALECT_POSTGRESQL {
+		// PostgreSQL dialect doesn't support:
 		// a) backticks around the database name, and
 		// b) DDL statements as part of a CreateDatabase operation (so schema
 		// must be set using a separate UpdateDatabase operation).
@@ -548,7 +732,12 @@ func CreateDatabase(ctx context.Context, adminClient *database.DatabaseAdminClie
 		req.DatabaseDialect = adminpb.DatabaseDialect_POSTGRESQL
 	} else {
 		req.CreateStatement = "CREATE DATABASE `" + dbName + "`"
-		req.ExtraStatements = conv.SpSchema.GetDDL(ddl.Config{Comments: false, ProtectIds: true, Tables: true, ForeignKeys: false, TargetDb: conv.TargetDb})
+		if migrationType == constants.DATAFLOW_MIGRATION {
+			req.ExtraStatements = conv.SpSchema.GetDDL(ddl.Config{Comments: false, ProtectIds: true, Tables: true, ForeignKeys: true, SpDialect: conv.SpDialect, Source: driver})
+		} else {
+			req.ExtraStatements = conv.SpSchema.GetDDL(ddl.Config{Comments: false, ProtectIds: true, Tables: true, ForeignKeys: false, SpDialect: conv.SpDialect, Source: driver})
+		}
+
 	}
 
 	op, err := adminClient.CreateDatabase(ctx, req)
@@ -560,25 +749,29 @@ func CreateDatabase(ctx context.Context, adminClient *database.DatabaseAdminClie
 	}
 	fmt.Fprintf(out, "Created database successfully.\n")
 
-	if conv.TargetDb == constants.TargetExperimentalPostgres {
+	if conv.SpDialect == constants.DIALECT_POSTGRESQL {
 		// Update schema separately for PG databases.
-		return UpdateDatabase(ctx, adminClient, dbURI, conv, out)
+		return UpdateDatabase(ctx, adminClient, dbURI, conv, out, driver)
 	}
 	return nil
 }
 
 // UpdateDatabase updates an existing spanner database.
-func UpdateDatabase(ctx context.Context, adminClient *database.DatabaseAdminClient, dbURI string, conv *internal.Conv, out *os.File) error {
+func UpdateDatabase(ctx context.Context, adminClient *database.DatabaseAdminClient, dbURI string, conv *internal.Conv, out *os.File, driver string) error {
 	fmt.Fprintf(out, "Updating schema for %s with default permissions ... \n", dbURI)
 	// The schema we send to Spanner excludes comments (since Cloud
 	// Spanner DDL doesn't accept them), and protects table and col names
 	// using backticks (to avoid any issues with Spanner reserved words).
 	// Foreign Keys are set to false since we create them post data migration.
-	schema := conv.SpSchema.GetDDL(ddl.Config{Comments: false, ProtectIds: true, Tables: true, ForeignKeys: false, TargetDb: conv.TargetDb})
+	schema := conv.SpSchema.GetDDL(ddl.Config{Comments: false, ProtectIds: true, Tables: true, ForeignKeys: false, SpDialect: conv.SpDialect, Source: driver})
 	req := &adminpb.UpdateDatabaseDdlRequest{
 		Database:   dbURI,
 		Statements: schema,
 	}
+	// Update queries for postgres as target db return response after more
+	// than 1 min for large schemas, therefore, timeout is specified as 5 minutes
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
 	op, err := adminClient.UpdateDatabaseDdl(ctx, req)
 	if err != nil {
 		return fmt.Errorf("can't build UpdateDatabaseDdlRequest: %w", utils.AnalyzeError(err, dbURI))
@@ -592,11 +785,17 @@ func UpdateDatabase(ctx context.Context, adminClient *database.DatabaseAdminClie
 
 // UpdateDDLForeignKeys updates the Spanner database with foreign key
 // constraints using ALTER TABLE statements.
-func UpdateDDLForeignKeys(ctx context.Context, adminClient *database.DatabaseAdminClient, dbURI string, conv *internal.Conv, out *os.File) error {
+func UpdateDDLForeignKeys(ctx context.Context, adminClient *database.DatabaseAdminClient, dbURI string, conv *internal.Conv, out *os.File, driver string, migrationType string) error {
+
+	if conv.SpDialect != constants.DIALECT_POSTGRESQL && migrationType == constants.DATAFLOW_MIGRATION {
+		//foreign keys were applied as part of CreateDatabase
+		return nil
+	}
+
 	// The schema we send to Spanner excludes comments (since Cloud
 	// Spanner DDL doesn't accept them), and protects table and col names
 	// using backticks (to avoid any issues with Spanner reserved words).
-	fkStmts := conv.SpSchema.GetDDL(ddl.Config{Comments: false, ProtectIds: true, Tables: false, ForeignKeys: true, TargetDb: conv.TargetDb})
+	fkStmts := conv.SpSchema.GetDDL(ddl.Config{Comments: false, ProtectIds: true, Tables: false, ForeignKeys: true, SpDialect: conv.SpDialect, Source: driver})
 	if len(fkStmts) == 0 {
 		return nil
 	}
@@ -607,8 +806,8 @@ time to create foreign keys (over 5 mins per batch of Foreign Keys even with no 
 Harbourbridge does not have control over a single foreign key creation time. The number 
 of concurrent Foreign Key Creation Requests sent to spanner can be increased by 
 tweaking the MaxWorkers variable (https://github.com/cloudspannerecosystem/harbourbridge/blob/master/conversion/conversion.go#L89).
-However, setting it to a very high value might lead to exceeding the admin quota limit.
-Recommended value is between 20-30.`)
+However, setting it to a very high value might lead to exceeding the admin quota limit. Harbourbridge tries to stay under the
+admin quota limit by spreading the FK creation requests over time.`)
 	}
 	msg := fmt.Sprintf("Updating schema of database %s with foreign key constraints ...", dbURI)
 	conv.Audit.Progress = *internal.NewProgress(int64(len(fkStmts)), msg, internal.Verbose(), true, int(internal.ForeignKeyUpdateInProgress))
@@ -655,6 +854,8 @@ Recommended value is between 20-30.`)
 			internal.VerbosePrintln("Updated schema with statement: " + fkStmt)
 			logger.Log.Debug("Updated schema with statement", zap.String("fkStmt", fkStmt))
 		}(fkStmt, workerID)
+		// Send out an FK creation request every second, with total of maxWorkers request being present in a batch.
+		time.Sleep(time.Second)
 	}
 	// Wait for all the goroutines to finish.
 	for i := 1; i <= MaxWorkers; i++ {
@@ -668,7 +869,7 @@ Recommended value is between 20-30.`)
 // WriteSchemaFile writes DDL statements in a file. It includes CREATE TABLE
 // statements and ALTER TABLE statements to add foreign keys.
 // The parameter name should end with a .txt.
-func WriteSchemaFile(conv *internal.Conv, now time.Time, name string, out *os.File) {
+func WriteSchemaFile(conv *internal.Conv, now time.Time, name string, out *os.File, driver string) {
 	f, err := os.Create(name)
 	if err != nil {
 		fmt.Fprintf(out, "Can't create schema file %s: %v\n", name, err)
@@ -679,7 +880,7 @@ func WriteSchemaFile(conv *internal.Conv, now time.Time, name string, out *os.Fi
 	// and doesn't add backticks around table and column names. This file is
 	// intended for explanatory and documentation purposes, and is not strictly
 	// legal Cloud Spanner DDL (Cloud Spanner doesn't currently support comments).
-	spDDL := conv.SpSchema.GetDDL(ddl.Config{Comments: true, ProtectIds: false, Tables: true, ForeignKeys: true, TargetDb: conv.TargetDb})
+	spDDL := conv.SpSchema.GetDDL(ddl.Config{Comments: true, ProtectIds: false, Tables: true, ForeignKeys: true, SpDialect: conv.SpDialect, Source: driver})
 	if len(spDDL) == 0 {
 		spDDL = []string{"\n-- Schema is empty -- no tables found\n"}
 	}
@@ -706,7 +907,7 @@ func WriteSchemaFile(conv *internal.Conv, now time.Time, name string, out *os.Fi
 
 	// We change 'Comments' to false and 'ProtectIds' to true below to write out a
 	// schema file that is a legal Cloud Spanner DDL.
-	spDDL = conv.SpSchema.GetDDL(ddl.Config{Comments: false, ProtectIds: true, Tables: true, ForeignKeys: true, TargetDb: conv.TargetDb})
+	spDDL = conv.SpSchema.GetDDL(ddl.Config{Comments: false, ProtectIds: true, Tables: true, ForeignKeys: true, SpDialect: conv.SpDialect, Source: driver})
 	if len(spDDL) == 0 {
 		spDDL = []string{"\n-- Schema is empty -- no tables found\n"}
 	}
@@ -753,9 +954,9 @@ func WriteConvGeneratedFiles(conv *internal.Conv, dbName string, driver string, 
 		return "", err
 	}
 	schemaFileName := dirPath + dbName + "_schema.txt"
-	WriteSchemaFile(conv, now, schemaFileName, out)
-	reportFileName := dirPath + dbName + "_report.txt"
-	Report(driver, nil, BytesRead, "", conv, reportFileName, out)
+	WriteSchemaFile(conv, now, schemaFileName, out, driver)
+	reportFileName := dirPath + dbName
+	Report(driver, nil, BytesRead, "", conv, reportFileName, dbName, out)
 	sessionFileName := dirPath + dbName + ".session.json"
 	WriteSessionFile(conv, sessionFileName, out)
 	return dirPath, nil
@@ -936,7 +1137,13 @@ func GetInfoSchema(sourceProfile profiles.SourceProfile, targetProfile profiles.
 		if err != nil {
 			return nil, err
 		}
-		return postgres.InfoSchemaImpl{Db: db, SourceProfile: sourceProfile, TargetProfile: targetProfile}, nil
+		temp := false
+		return postgres.InfoSchemaImpl{
+			Db:             db,
+			SourceProfile:  sourceProfile,
+			TargetProfile:  targetProfile,
+			IsSchemaUnique: &temp, //this is a workaround to set a bool pointer
+		}, nil
 	case constants.DYNAMODB:
 		mySession := session.Must(session.NewSession())
 		dydbClient := dydb.New(mySession, connectionConfig.(*aws.Config))

@@ -105,31 +105,8 @@ func prepareIntegrationTest(t *testing.T) string {
 	return tmpdir
 }
 
-func TestIntegration_PGDUMP_Command(t *testing.T) {
-	t.Parallel()
-
-	tmpdir := prepareIntegrationTest(t)
-	defer os.RemoveAll(tmpdir)
-
-	now := time.Now()
-	dbName, _ := utils.GetDatabaseName(constants.PGDUMP, now)
-	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
-
-	dataFilepath := "../../test_data/pg_dump.test.out"
-	filePrefix := filepath.Join(tmpdir, dbName+".")
-
-	args := fmt.Sprintf("-prefix %s -instance %s -dbname %s < %s", filePrefix, instanceID, dbName, dataFilepath)
-	err := common.RunCommand(args, projectID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Drop the database later.
-	defer dropDatabase(t, dbURI)
-
-	checkResults(t, dbURI)
-}
-
 func TestIntegration_PGDUMP_SchemaAndDataSubcommand(t *testing.T) {
+	onlyRunForEmulatorTest(t)
 	t.Parallel()
 
 	tmpdir := prepareIntegrationTest(t)
@@ -140,7 +117,7 @@ func TestIntegration_PGDUMP_SchemaAndDataSubcommand(t *testing.T) {
 	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
 
 	dataFilepath := "../../test_data/pg_dump.test.out"
-	filePrefix := filepath.Join(tmpdir, dbName+".")
+	filePrefix := filepath.Join(tmpdir, dbName)
 
 	args := fmt.Sprintf("schema-and-data -prefix %s -source=postgres -target-profile='instance=%s,dbName=%s' < %s", filePrefix, instanceID, dbName, dataFilepath)
 	err := common.RunCommand(args, projectID)
@@ -174,29 +151,6 @@ func TestIntegration_PGDUMP_SchemaSubcommand(t *testing.T) {
 	defer dropDatabase(t, dbURI)
 }
 
-func TestIntegration_POSTGRES_Command(t *testing.T) {
-	onlyRunForEmulatorTest(t)
-	t.Parallel()
-
-	tmpdir := prepareIntegrationTest(t)
-	defer os.RemoveAll(tmpdir)
-
-	now := time.Now()
-	dbName, _ := utils.GetDatabaseName(constants.POSTGRES, now)
-	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
-	filePrefix := filepath.Join(tmpdir, dbName+".")
-
-	args := fmt.Sprintf("-instance %s -dbname %s -prefix %s -driver %s", instanceID, dbName, filePrefix, constants.POSTGRES)
-	err := common.RunCommand(args, projectID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Drop the database later.
-	defer dropDatabase(t, dbURI)
-
-	checkResults(t, dbURI)
-}
-
 func TestIntegration_POSTGRES_SchemaAndDataSubcommand(t *testing.T) {
 	onlyRunForEmulatorTest(t)
 	t.Parallel()
@@ -207,7 +161,7 @@ func TestIntegration_POSTGRES_SchemaAndDataSubcommand(t *testing.T) {
 	now := time.Now()
 	dbName, _ := utils.GetDatabaseName(constants.POSTGRES, now)
 	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
-	filePrefix := filepath.Join(tmpdir, dbName+".")
+	filePrefix := filepath.Join(tmpdir, dbName)
 
 	args := fmt.Sprintf("schema-and-data -prefix %s -source=postgres -target-profile='instance=%s,dbName=%s'", filePrefix, instanceID, dbName)
 	err := common.RunCommand(args, projectID)
@@ -230,7 +184,7 @@ func TestIntegration_POSTGRES_SchemaSubcommand(t *testing.T) {
 	now := time.Now()
 	dbName, _ := utils.GetDatabaseName(constants.POSTGRES, now)
 	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
-	filePrefix := filepath.Join(tmpdir, dbName+".")
+	filePrefix := filepath.Join(tmpdir, dbName)
 
 	args := fmt.Sprintf("schema -prefix %s -source=postgres -target-profile='instance=%s,dbName=%s'", filePrefix, instanceID, dbName)
 	err := common.RunCommand(args, projectID)

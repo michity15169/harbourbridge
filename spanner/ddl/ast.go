@@ -54,6 +54,9 @@ const (
 	MaxLength = math.MaxInt64
 	// StringMaxLength represents maximum allowed STRING length.
 	StringMaxLength = 2621440
+	// BytesMaxLength represents maximum allowed BYTES length.
+	BytesMaxLength        = 10485760
+	MaxNonKeyColumnLength = 1677721600
 
 	// Types specific to Spanner with postgresql dialect, when they differ from
 	// Spanner with google_standard_sql.
@@ -67,9 +70,40 @@ const (
 	PGVarchar string = "VARCHAR"
 	// PGTimestamptz represent TIMESTAMPTZ, which is TIMESTAMP type in PG.
 	PGTimestamptz string = "TIMESTAMPTZ"
+	// Jsonb represents the PG.JSONB type
+	PGJSONB string = "JSONB"
 	// PGMaxLength represents sentinel for Type's Len field in PG.
 	PGMaxLength = 2621440
 )
+
+var STANDARD_TYPE_TO_PGSQL_TYPEMAP = map[string]string{
+	Bytes:     PGBytea,
+	Float64:   PGFloat8,
+	Int64:     PGInt8,
+	String:    PGVarchar,
+	Timestamp: PGTimestamptz,
+	JSON:      PGJSONB,
+}
+
+var PGSQL_TO_STANDARD_TYPE_TYPEMAP = map[string]string{
+	PGBytea:       Bytes,
+	PGFloat8:      Float64,
+	PGInt8:        Int64,
+	PGVarchar:     String,
+	PGTimestamptz: Timestamp,
+	PGJSONB:       JSON,
+}
+
+// PGDialect keyword list
+// Assumption is that this list PGSQL dialect uses the same keywords
+var PGSQL_RESERVED_KEYWORD_LIST = []string{"ALL", "ANALYSE", "ANALYZE", "AND", "ANY", "ARRAY", "AS", "ASC", "ASYMMETRIC", "AUTHORIZATION", "BETWEEN", "BIGINT", "BINARY", "BIT", "BOOLEAN", "BOTH", "CASE", "CAST",
+	"CHAR", "CHARACTER", "CHECK", "COALESCE", "COLLATE", "COLLATION", "COLUMN", "CONCURRENTLY", "CONSTRAINT", "CREATE", "CROSS", "CURRENT_CATALOG", "CURRENT_DATE", "CURRENT_ROLE", "CURRENT_SCHEMA",
+	"CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER", "DEC", "DECIMAL", "DEFAULT", "DEFERRABLE", "DESC", "DISTINCT", "DO", "ELSE", "END", "EXCEPT", "EXISTS", "EXTRACT", "FALSE", "FETCH", "FLOAT", "FOR", "FOREIGN",
+	"FREEZE", "FROM", "FULL", "GRANT", "GREATEST", "GROUP", "GROUPING", "HAVING", "ILIKE", "IN", "INITIALLY", "INNER", "INOUT", "INT", "INTEGER", "INTERSECT", "INTERVAL", "INTO", "IS", "ISNULL", "JOIN", "LATERAL", "LEADING",
+	"LEAST", "LEFT", "LIKE", "LIMIT", "LOCALTIME", "LOCALTIMESTAMP", "NATIONAL", "NATURAL", "NCHAR", "NONE", "NORMALIZE", "NOT", "NOTNULL", "NULL", "NULLIF", "NUMERIC", "OFFSET", "ON", "ONLY", "OR", "ORDER", "OUT", "OUTER",
+	"OVERLAPS", "OVERLAY", "PLACING", "POSITION", "PRECISION", "PRIMARY", "REAL", "REFERENCES", "RETURNING", "RIGHT", "ROW", "SELECT", "SESSION_USER", "SETOF", "SIMILAR", "SMALLINT", "SOME", "SUBSTRING", "SYMMETRIC",
+	"TABLE", "TABLESAMPLE", "THEN", "TIME", "TIMESTAMP", "TO", "TRAILING", "TREAT", "TRIM", "TRUE", "UNION", "UNIQUE", "USER", "USING", "VALUES", "VARCHAR", "VARIADIC", "VERBOSE", "WHEN", "WHERE", "WINDOW", "WITH",
+	"XMLATTRIBUTES", "XMLCONCAT", "XMLELEMENT", "XMLEXISTS", "XMLFOREST", "XMLNAMESPACES", "XMLPARSE", "XMLPI", "XMLROOT", "XMLSERIALIZE", "XMLTABLE"}
 
 // Type represents the type of a column.
 //
@@ -104,22 +138,16 @@ func (ty Type) PrintColumnDefType() string {
 	return str
 }
 
-func (ty Type) PGPrintColumnDefType() string {
-	var str string
-	switch ty.Name {
-	case Bytes:
-		str = PGBytea
-	case Float64:
-		str = PGFloat8
-	case Int64:
-		str = PGInt8
-	case String:
-		str = PGVarchar
-	case Timestamp:
-		str = PGTimestamptz
-	default:
-		str = ty.Name
+func GetPGType(spType Type) string {
+	pgType, ok := STANDARD_TYPE_TO_PGSQL_TYPEMAP[spType.Name]
+	if ok {
+		return pgType
 	}
+	return spType.Name
+}
+
+func (ty Type) PGPrintColumnDefType() string {
+	str := GetPGType(ty)
 	// PG doesn't support array types, and we don't expect to receive a type
 	// with IsArray set to true. In the unlikely event, set to string type.
 	if ty.IsArray {
@@ -158,13 +186,36 @@ type Config struct {
 	ProtectIds  bool // If true, table and col names are quoted using backticks (avoids reserved-word issue).
 	Tables      bool // If true, print tables
 	ForeignKeys bool // If true, print foreign key constraints.
-	TargetDb    string
+	SpDialect   string
+	Source      string //SourceDB information for determining case-sensitivity handling for PGSQL
+}
+
+func isIdentifierReservedInPG(identifier string) bool {
+	for _, KEYWORD := range PGSQL_RESERVED_KEYWORD_LIST {
+		if strings.EqualFold(KEYWORD, identifier) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSourceCaseSensitive(source string) bool {
+	switch source {
+	case constants.POSTGRES, constants.PGDUMP:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c Config) quote(s string) string {
 	if c.ProtectIds {
-		if c.TargetDb == constants.TargetExperimentalPostgres {
-			return s
+		if c.SpDialect == constants.DIALECT_POSTGRESQL {
+			if isIdentifierReservedInPG(s) || isSourceCaseSensitive(c.Source) {
+				return "\"" + s + "\""
+			} else {
+				return s
+			}
 		} else {
 			return "`" + s + "`"
 		}
@@ -177,7 +228,7 @@ func (c Config) quote(s string) string {
 // needs of PrintCreateTable.
 func (cd ColumnDef) PrintColumnDef(c Config) (string, string) {
 	var s string
-	if c.TargetDb == constants.TargetExperimentalPostgres {
+	if c.SpDialect == constants.DIALECT_POSTGRESQL {
 		s = fmt.Sprintf("%s %s", c.quote(cd.Name), cd.T.PGPrintColumnDefType())
 	} else {
 		s = fmt.Sprintf("%s %s", c.quote(cd.Name), cd.T.PrintColumnDefType())
@@ -195,15 +246,15 @@ func (cd ColumnDef) PrintColumnDef(c Config) (string, string) {
 //	key_part:
 //	   column_name [{ ASC | DESC }]
 type IndexKey struct {
-	Col   string
+	ColId string
 	Desc  bool // Default order is ascending i.e. Desc = false.
 	Order int
 }
 
-// PrintIndexKey unparses the index keys.
-func (pk IndexKey) PrintIndexKey(c Config) string {
-	col := c.quote(pk.Col)
-	if pk.Desc {
+// PrintPkOrIndexKey unparses the primary or index keys.
+func (idx IndexKey) PrintPkOrIndexKey(ct CreateTable, c Config) string {
+	col := c.quote(ct.ColDefs[idx.ColId].Name)
+	if idx.Desc {
 		return fmt.Sprintf("%s DESC", col)
 	}
 	// Don't print out ASC -- that's the default.
@@ -215,49 +266,50 @@ func (pk IndexKey) PrintIndexKey(c Config) string {
 //	   [ CONSTRAINT constraint_name ]
 //		  FOREIGN KEY ( column_name [, ... ] ) REFERENCES ref_table ( ref_column [, ... ] ) }
 type Foreignkey struct {
-	Name         string
-	Columns      []string
-	ReferTable   string
-	ReferColumns []string
-	Id           string
+	Name           string
+	ColIds         []string
+	ReferTableId   string
+	ReferColumnIds []string
+	Id             string
 }
 
 // PrintForeignKey unparses the foreign keys.
 func (k Foreignkey) PrintForeignKey(c Config) string {
 	var cols, referCols []string
-	for i, col := range k.Columns {
+	for i, col := range k.ColIds {
 		cols = append(cols, c.quote(col))
-		referCols = append(referCols, c.quote(k.ReferColumns[i]))
+		referCols = append(referCols, c.quote(k.ReferColumnIds[i]))
 	}
 	var s string
 	if k.Name != "" {
 		s = fmt.Sprintf("CONSTRAINT %s ", c.quote(k.Name))
 	}
-	return s + fmt.Sprintf("FOREIGN KEY (%s) REFERENCES %s (%s)", strings.Join(cols, ", "), c.quote(k.ReferTable), strings.Join(referCols, ", "))
+	return s + fmt.Sprintf("FOREIGN KEY (%s) REFERENCES %s (%s)", strings.Join(cols, ", "), c.quote(k.ReferTableId), strings.Join(referCols, ", "))
 }
 
 // CreateTable encodes the following DDL definition:
 //
 //	create_table: CREATE TABLE table_name ([column_def, ...] ) primary_key [, cluster]
 type CreateTable struct {
-	Name     string
-	ColNames []string             // Provides names and order of columns
-	ColDefs  map[string]ColumnDef // Provides definition of columns (a map for simpler/faster lookup during type processing)
-	Pks      []IndexKey
-	Fks      []Foreignkey
-	Indexes  []CreateIndex
-	Parent   string //if not empty, this table will be interleaved
-	Comment  string
-	Id       string
+	Name          string
+	ColIds        []string // Provides names and order of columns
+	ShardIdColumn string
+	ColDefs       map[string]ColumnDef // Provides definition of columns (a map for simpler/faster lookup during type processing)
+	PrimaryKeys   []IndexKey
+	ForeignKeys   []Foreignkey
+	Indexes       []CreateIndex
+	ParentId      string //if not empty, this table will be interleaved
+	Comment       string
+	Id            string
 }
 
 // PrintCreateTable unparses a CREATE TABLE statement.
-func (ct CreateTable) PrintCreateTable(config Config) string {
+func (ct CreateTable) PrintCreateTable(spSchema Schema, config Config) string {
 	var col []string
 	var colComment []string
 	var keys []string
-	for _, cn := range ct.ColNames {
-		s, c := ct.ColDefs[cn].PrintColumnDef(config)
+	for _, colId := range ct.ColIds {
+		s, c := ct.ColDefs[colId].PrintColumnDef(config)
 		s = "\t" + s + ","
 		col = append(col, s)
 		colComment = append(colComment, c)
@@ -274,13 +326,13 @@ func (ct CreateTable) PrintCreateTable(config Config) string {
 	}
 
 	orderedPks := []IndexKey{}
-	orderedPks = append(orderedPks, ct.Pks...)
+	orderedPks = append(orderedPks, ct.PrimaryKeys...)
 	sort.Slice(orderedPks, func(i, j int) bool {
 		return orderedPks[i].Order < orderedPks[j].Order
 	})
 
 	for _, p := range orderedPks {
-		keys = append(keys, p.PrintIndexKey(config))
+		keys = append(keys, p.PrintPkOrIndexKey(ct, config))
 	}
 	var tableComment string
 	if config.Comments && len(ct.Comment) > 0 {
@@ -288,20 +340,21 @@ func (ct CreateTable) PrintCreateTable(config Config) string {
 	}
 
 	var interleave string
-	if ct.Parent != "" {
-		if config.TargetDb == constants.TargetExperimentalPostgres {
+	if ct.ParentId != "" {
+		parent := spSchema[ct.ParentId].Name
+		if config.SpDialect == constants.DIALECT_POSTGRESQL {
 			// PG spanner only supports PRIMARY KEY() inside the CREATE TABLE()
 			// and thus INTERLEAVE follows immediately after closing brace.
-			interleave = " INTERLEAVE IN PARENT " + config.quote(ct.Parent)
+			interleave = " INTERLEAVE IN PARENT " + config.quote(parent)
 		} else {
-			interleave = ",\nINTERLEAVE IN PARENT " + config.quote(ct.Parent)
+			interleave = ",\nINTERLEAVE IN PARENT " + config.quote(parent)
 		}
 	}
 
 	if len(keys) == 0 {
 		return fmt.Sprintf("%sCREATE TABLE %s (\n%s) %s", tableComment, config.quote(ct.Name), cols, interleave)
 	}
-	if config.TargetDb == constants.TargetExperimentalPostgres {
+	if config.SpDialect == constants.DIALECT_POSTGRESQL {
 		return fmt.Sprintf("%sCREATE TABLE %s (\n%s\tPRIMARY KEY (%s)\n)%s", tableComment, config.quote(ct.Name), cols, strings.Join(keys, ", "), interleave)
 	}
 	return fmt.Sprintf("%sCREATE TABLE %s (\n%s) PRIMARY KEY (%s)%s", tableComment, config.quote(ct.Name), cols, strings.Join(keys, ", "), interleave)
@@ -311,18 +364,18 @@ func (ct CreateTable) PrintCreateTable(config Config) string {
 //
 //	create index: CREATE [UNIQUE] [NULL_FILTERED] INDEX index_name ON table_name ( key_part [, ...] ) [ storing_clause ] [ , interleave_clause ]
 type CreateIndex struct {
-	Name          string
-	Table         string
-	Unique        bool
-	Keys          []IndexKey
-	Id            string
-	StoredColumns []string
+	Name            string
+	TableId         string `json:"TableId"`
+	Unique          bool
+	Keys            []IndexKey
+	Id              string
+	StoredColumnIds []string
 	// We have no requirements for null-filtered option and
 	// interleaving clauses yet, so we omit them for now.
 }
 
 // PrintCreateIndex unparses a CREATE INDEX statement.
-func (ci CreateIndex) PrintCreateIndex(c Config) string {
+func (ci CreateIndex) PrintCreateIndex(ct CreateTable, c Config) string {
 	var keys []string
 
 	orderedKeys := []IndexKey{}
@@ -332,35 +385,39 @@ func (ci CreateIndex) PrintCreateIndex(c Config) string {
 	})
 
 	for _, p := range orderedKeys {
-		keys = append(keys, p.PrintIndexKey(c))
+		keys = append(keys, p.PrintPkOrIndexKey(ct, c))
 	}
 	var unique, stored, storingClause string
 	if ci.Unique {
 		unique = "UNIQUE "
 	}
-	if c.TargetDb == constants.TargetExperimentalPostgres {
+	if c.SpDialect == constants.DIALECT_POSTGRESQL {
 		stored = "INCLUDE"
 	} else {
 		stored = "STORING"
 	}
-	if ci.StoredColumns != nil {
-		storingClause = fmt.Sprintf(" %s (%s)", stored, strings.Join(ci.StoredColumns, ", "))
+	if ci.StoredColumnIds != nil {
+		storedColumns := []string{}
+		for _, colId := range ci.StoredColumnIds {
+			storedColumns = append(storedColumns, ct.ColDefs[colId].Name)
+		}
+		storingClause = fmt.Sprintf(" %s (%s)", stored, strings.Join(ci.StoredColumnIds, ", "))
 	}
-	return fmt.Sprintf("CREATE %sINDEX %s ON %s (%s)%s", unique, c.quote(ci.Name), c.quote(ci.Table), strings.Join(keys, ", "), storingClause)
+	return fmt.Sprintf("CREATE %sINDEX %s ON %s (%s)%s", unique, c.quote(ci.Name), c.quote(ct.Name), strings.Join(keys, ", "), storingClause)
 }
 
 // PrintForeignKeyAlterTable unparses the foreign keys using ALTER TABLE.
-func (k Foreignkey) PrintForeignKeyAlterTable(c Config, tableName string) string {
+func (k Foreignkey) PrintForeignKeyAlterTable(spannerSchema Schema, c Config, tableId string) string {
 	var cols, referCols []string
-	for i, col := range k.Columns {
-		cols = append(cols, c.quote(col))
-		referCols = append(referCols, c.quote(k.ReferColumns[i]))
+	for i, col := range k.ColIds {
+		cols = append(cols, spannerSchema[tableId].ColDefs[col].Name)
+		referCols = append(referCols, spannerSchema[k.ReferTableId].ColDefs[k.ReferColumnIds[i]].Name)
 	}
 	var s string
 	if k.Name != "" {
 		s = fmt.Sprintf("CONSTRAINT %s ", c.quote(k.Name))
 	}
-	return fmt.Sprintf("ALTER TABLE %s ADD %sFOREIGN KEY (%s) REFERENCES %s (%s)", c.quote(tableName), s, strings.Join(cols, ", "), c.quote(k.ReferTable), strings.Join(referCols, ", "))
+	return fmt.Sprintf("ALTER TABLE %s ADD %sFOREIGN KEY (%s) REFERENCES %s (%s)", c.quote(spannerSchema[tableId].Name), s, strings.Join(cols, ", "), c.quote(spannerSchema[k.ReferTableId].Name), strings.Join(referCols, ", "))
 }
 
 // Schema stores a map of table names and Tables.
@@ -373,25 +430,28 @@ func NewSchema() Schema {
 
 // Tables are ordered in alphabetical order with one exception: interleaved
 // tables appear after the definition of their parent table.
+// 
 // TODO: Move this method to mapping.go and preserve the table names in sorted
 // order in conv so that we don't need to order the table names multiple times.
-func OrderTables(s Schema) []string {
-	var tableNames, sortedTableNames []string
-	for t := range s {
-		tableNames = append(tableNames, t)
+func GetSortedTableIdsBySpName(s Schema) []string {
+	var tableNames, sortedTableNames, sortedTableIds []string
+	tableNameIdMap := map[string]string{}
+	for _, t := range s {
+		tableNames = append(tableNames, t.Name)
+		tableNameIdMap[t.Name] = t.Id
 	}
 	sort.Strings(tableNames)
 	tableQueue := tableNames
 	tableAdded := make(map[string]bool)
 	for len(tableQueue) > 0 {
 		tableName := tableQueue[0]
-		table := s[tableName]
+		table := s[tableNameIdMap[tableName]]
 		tableQueue = tableQueue[1:]
 
 		// Add table t if either:
 		// a) t is not interleaved in another table, or
 		// b) t is interleaved in another table and that table has already been added to the list.
-		if table.Parent == "" || tableAdded[table.Parent] {
+		if table.ParentId == "" || tableAdded[s[table.ParentId].Name] {
 			sortedTableNames = append(sortedTableNames, tableName)
 			tableAdded[tableName] = true
 		} else {
@@ -404,7 +464,10 @@ func OrderTables(s Schema) []string {
 			tableQueue = append(tableQueue, tableName)
 		}
 	}
-	return sortedTableNames
+	for _, tableName := range sortedTableNames {
+		sortedTableIds = append(sortedTableIds, tableNameIdMap[tableName])
+	}
+	return sortedTableIds
 }
 
 // GetDDL returns the string representation of Spanner schema represented by Schema struct.
@@ -413,13 +476,13 @@ func OrderTables(s Schema) []string {
 // definition of their parent table.
 func (s Schema) GetDDL(c Config) []string {
 	var ddl []string
-	sortedTableNames := OrderTables(s)
+	tableIds := GetSortedTableIdsBySpName(s)
 
 	if c.Tables {
-		for _, tableName := range sortedTableNames {
-			ddl = append(ddl, s[tableName].PrintCreateTable(c))
-			for _, index := range s[tableName].Indexes {
-				ddl = append(ddl, index.PrintCreateIndex(c))
+		for _, tableId := range tableIds {
+			ddl = append(ddl, s[tableId].PrintCreateTable(s, c))
+			for _, index := range s[tableId].Indexes {
+				ddl = append(ddl, index.PrintCreateIndex(s[tableId], c))
 			}
 		}
 	}
@@ -430,9 +493,9 @@ func (s Schema) GetDDL(c Config) []string {
 	// before they are referenced by foreign key constraints) and the possibility
 	// of circular foreign keys definitions. We opt for simplicity.
 	if c.ForeignKeys {
-		for _, t := range sortedTableNames {
-			for _, fk := range s[t].Fks {
-				ddl = append(ddl, fk.PrintForeignKeyAlterTable(c, t))
+		for _, t := range tableIds {
+			for _, fk := range s[t].ForeignKeys {
+				ddl = append(ddl, fk.PrintForeignKeyAlterTable(s, c, t))
 			}
 		}
 	}
@@ -442,7 +505,7 @@ func (s Schema) GetDDL(c Config) []string {
 // CheckInterleaved checks if schema contains interleaved tables.
 func (s Schema) CheckInterleaved() bool {
 	for _, table := range s {
-		if table.Parent != "" {
+		if table.ParentId != "" {
 			return true
 		}
 	}

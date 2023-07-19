@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"strings"
+	"sync"
 	"time"
 
 	dataflow "cloud.google.com/go/dataflow/apiv1beta3"
@@ -56,22 +57,28 @@ type DatastreamCfg struct {
 	SourceConnectionConfig      SrcConnCfg
 	DestinationConnectionConfig DstConnCfg
 	Properties                  string
+	tableList                   []string
 }
 
 type DataflowCfg struct {
-	JobName  string
-	Location string
+	JobName            string
+	Location           string
+	HostProjectId      string
+	Network            string
+	Subnetwork         string
+	DbNameToShardIdMap map[string]string
 }
 
 type StreamingCfg struct {
 	DatastreamCfg DatastreamCfg
 	DataflowCfg   DataflowCfg
 	TmpDir        string
+	DataShardId   string
 }
 
 // VerifyAndUpdateCfg checks the fields and errors out if certain fields are empty.
 // It then auto-populates certain empty fields like StreamId and Dataflow JobName.
-func VerifyAndUpdateCfg(streamingCfg *StreamingCfg, dbName string) error {
+func VerifyAndUpdateCfg(streamingCfg *StreamingCfg, dbName string, tableList []string) error {
 	dsCfg := streamingCfg.DatastreamCfg
 	if dsCfg.StreamLocation == "" {
 		return fmt.Errorf("please specify DatastreamCfg.StreamLocation in the streaming config")
@@ -95,6 +102,7 @@ func VerifyAndUpdateCfg(streamingCfg *StreamingCfg, dbName string) error {
 	if dsCfg.StreamId == "" && dsCfg.StreamDisplayName == "" {
 		// TODO: Update names to have more info like dbname.
 		streamId, err := utils.GenerateName("hb-stream-" + dbName)
+		streamId = strings.Replace(streamId, "_", "-", -1)
 		if err != nil {
 			return fmt.Errorf("error generating stream name: %v", err)
 		}
@@ -105,6 +113,9 @@ func VerifyAndUpdateCfg(streamingCfg *StreamingCfg, dbName string) error {
 	} else if dsCfg.StreamDisplayName == "" {
 		streamingCfg.DatastreamCfg.StreamDisplayName = streamingCfg.DatastreamCfg.StreamId
 	}
+
+	// Populate the tables to be streamed in the datastreamCfg from the dervied list from session file
+	streamingCfg.DatastreamCfg.tableList = append(streamingCfg.DatastreamCfg.tableList, tableList...)
 
 	if dfCfg.JobName == "" {
 		// Update names to have more info like dbname.
@@ -139,7 +150,7 @@ func VerifyAndUpdateCfg(streamingCfg *StreamingCfg, dbName string) error {
 }
 
 // ReadStreamingConfig reads the file and unmarshalls it into the StreamingCfg struct.
-func ReadStreamingConfig(file, dbName string) (StreamingCfg, error) {
+func ReadStreamingConfig(file, dbName string, tableList []string) (StreamingCfg, error) {
 	streamingCfg := StreamingCfg{}
 	cfgFile, err := ioutil.ReadFile(file)
 	if err != nil {
@@ -149,29 +160,56 @@ func ReadStreamingConfig(file, dbName string) (StreamingCfg, error) {
 	if err != nil {
 		return streamingCfg, fmt.Errorf("unable to unmarshall json due to: %v", err)
 	}
-	err = VerifyAndUpdateCfg(&streamingCfg, dbName)
+	err = VerifyAndUpdateCfg(&streamingCfg, dbName, tableList)
 	if err != nil {
 		return streamingCfg, fmt.Errorf("streaming config is incomplete: %v", err)
 	}
 	return streamingCfg, nil
 }
 
-func getMysqlSourceStreamConfig(dbName string) *datastreampb.SourceConfig_MysqlSourceConfig {
-	mydb := &datastreampb.MysqlDatabase{
-		Database: dbName,
+// dbName is the name of the database to be migrated.
+// tabeList is the common list of tables that need to be migrated from each database
+func getMysqlSourceStreamConfig(dbList []profiles.LogicalShard, tableList []string) *datastreampb.SourceConfig_MysqlSourceConfig {
+	mysqlTables := []*datastreampb.MysqlTable{}
+	for _, table := range tableList {
+		includeTable := &datastreampb.MysqlTable{
+			Table: table,
+		}
+		mysqlTables = append(mysqlTables, includeTable)
 	}
+	includeDbList := []*datastreampb.MysqlDatabase{}
+	for _, db := range dbList {
+		//create include db object
+		includeDb := &datastreampb.MysqlDatabase{
+			Database:    db.DbName,
+			MysqlTables: mysqlTables,
+		}
+		includeDbList = append(includeDbList, includeDb)
+	}
+	//TODO: Clean up fmt.Printf logs and replace them with zap logger.
+	fmt.Printf("Include DB List for datastream: %+v\n", includeDbList)
 	mysqlSrcCfg := &datastreampb.MysqlSourceConfig{
-		IncludeObjects: &datastreampb.MysqlRdbms{MysqlDatabases: []*datastreampb.MysqlDatabase{mydb}},
+		IncludeObjects:             &datastreampb.MysqlRdbms{MysqlDatabases: includeDbList},
+		MaxConcurrentBackfillTasks: 50,
 	}
 	return &datastreampb.SourceConfig_MysqlSourceConfig{MysqlSourceConfig: mysqlSrcCfg}
 }
 
-func getOracleSourceStreamConfig(dbName string) *datastreampb.SourceConfig_OracleSourceConfig {
+func getOracleSourceStreamConfig(dbName string, tableList []string) *datastreampb.SourceConfig_OracleSourceConfig {
+	oracleTables := []*datastreampb.OracleTable{}
+	for _, table := range tableList {
+		includeTable := &datastreampb.OracleTable{
+			Table: table,
+		}
+		oracleTables = append(oracleTables, includeTable)
+	}
 	oracledb := &datastreampb.OracleSchema{
-		Schema: dbName,
+		Schema:       dbName,
+		OracleTables: oracleTables,
 	}
 	oracleSrcCfg := &datastreampb.OracleSourceConfig{
-		IncludeObjects: &datastreampb.OracleRdbms{OracleSchemas: []*datastreampb.OracleSchema{oracledb}},
+		IncludeObjects:             &datastreampb.OracleRdbms{OracleSchemas: []*datastreampb.OracleSchema{oracledb}},
+		MaxConcurrentBackfillTasks: 50,
 	}
 	return &datastreampb.SourceConfig_OracleSourceConfig{OracleSourceConfig: oracleSrcCfg}
 }
@@ -193,23 +231,28 @@ func getPostgreSQLSourceStreamConfig(properties string) (*datastreampb.SourceCon
 		return nil, fmt.Errorf("replication slot or publication not specified")
 	}
 	postgresSrcCfg := &datastreampb.PostgresqlSourceConfig{
-		ExcludeObjects:  &datastreampb.PostgresqlRdbms{PostgresqlSchemas: excludeObjects},
-		ReplicationSlot: replicationSlot,
-		Publication:     publication,
+		ExcludeObjects:             &datastreampb.PostgresqlRdbms{PostgresqlSchemas: excludeObjects},
+		ReplicationSlot:            replicationSlot,
+		Publication:                publication,
+		MaxConcurrentBackfillTasks: 50,
 	}
 	return &datastreampb.SourceConfig_PostgresqlSourceConfig{PostgresqlSourceConfig: postgresSrcCfg}, nil
 }
 
-func getSourceStreamConfig(srcCfg *datastreampb.SourceConfig, sourceProfile profiles.SourceProfile, datastreamCfg DatastreamCfg) error {
+func getSourceStreamConfig(srcCfg *datastreampb.SourceConfig, sourceProfile profiles.SourceProfile, dbList []profiles.LogicalShard, datastreamCfg DatastreamCfg) error {
 	switch sourceProfile.Driver {
 	case constants.MYSQL:
-		srcCfg.SourceStreamConfig = getMysqlSourceStreamConfig(sourceProfile.Conn.Mysql.Db)
+		// For MySQL, it supports sharded migrations and batching databases in a physical machine into a single
+		//Datastream, so dbList is passed.
+		srcCfg.SourceStreamConfig = getMysqlSourceStreamConfig(dbList, datastreamCfg.tableList)
 		return nil
 	case constants.ORACLE:
-		// For Oracle, the User name denotes the name of the schema while the dbName parameter has the SID.
-		srcCfg.SourceStreamConfig = getOracleSourceStreamConfig(sourceProfile.Conn.Oracle.User)
+		// For Oracle, no sharded migrations or db batching support, so the dbList always contains only one element.
+		srcCfg.SourceStreamConfig = getOracleSourceStreamConfig(dbList[0].DbName, datastreamCfg.tableList)
 		return nil
 	case constants.POSTGRES:
+		// For Postgres, tables need to be configured at the schema level, which will require more information List<Dbs> and Map<Schema, List<Tables>>
+		// instead of List<Dbs> and List<Tables>. Becuase of this we do not configure postgres datastream at individual table level currently.
 		sourceStreamConfig, err := getPostgreSQLSourceStreamConfig(datastreamCfg.Properties)
 		if err == nil {
 			srcCfg.SourceStreamConfig = sourceStreamConfig
@@ -221,7 +264,7 @@ func getSourceStreamConfig(srcCfg *datastreampb.SourceConfig, sourceProfile prof
 }
 
 // LaunchStream populates the parameters from the streaming config and triggers a stream on Cloud Datastream.
-func LaunchStream(ctx context.Context, sourceProfile profiles.SourceProfile, projectID string, datastreamCfg DatastreamCfg) error {
+func LaunchStream(ctx context.Context, sourceProfile profiles.SourceProfile, dbList []profiles.LogicalShard, projectID string, datastreamCfg DatastreamCfg) error {
 	fmt.Println("Launching stream ", fmt.Sprintf("projects/%s/locations/%s", projectID, datastreamCfg.StreamLocation))
 	dsClient, err := datastream.NewClient(ctx)
 	if err != nil {
@@ -237,7 +280,7 @@ func LaunchStream(ctx context.Context, sourceProfile profiles.SourceProfile, pro
 	srcCfg := &datastreampb.SourceConfig{
 		SourceConnectionProfile: fmt.Sprintf("projects/%s/locations/%s/connectionProfiles/%s", projectID, datastreamCfg.SourceConnectionConfig.Location, datastreamCfg.SourceConnectionConfig.Name),
 	}
-	err = getSourceStreamConfig(srcCfg, sourceProfile, datastreamCfg)
+	err = getSourceStreamConfig(srcCfg, sourceProfile, dbList, datastreamCfg)
 	if err != nil {
 		return fmt.Errorf("could not get source stream config: %v", err)
 	}
@@ -293,41 +336,72 @@ func LaunchStream(ctx context.Context, sourceProfile profiles.SourceProfile, pro
 }
 
 func CleanUpStreamingJobs(ctx context.Context, conv *internal.Conv, projectID, region string) error {
+	//create clients
 	c, err := dataflow.NewJobsV1Beta3Client(ctx)
 	if err != nil {
 		return fmt.Errorf("could not create job client: %v", err)
 	}
 	defer c.Close()
 	fmt.Println("Created dataflow job client...")
+	dsClient, err := datastream.NewClient(ctx)
+	fmt.Println("Created datastream client...")
+	if err != nil {
+		return fmt.Errorf("datastream client can not be created: %v", err)
+	}
+	defer dsClient.Close()
 
+	//clean up for single instance migrations
+	if conv.Audit.StreamingStats.DataflowJobId != "" {
+		CleanupDataflowJob(ctx, c, conv.Audit.StreamingStats.DataflowJobId, projectID, region)
+	}
+	if conv.Audit.StreamingStats.DataStreamName != "" {
+		CleanupDatastream(ctx, dsClient, conv.Audit.StreamingStats.DataStreamName, projectID, region)
+	}
+	// clean up jobs for sharded migrations (with error handling)
+	for _, dfId := range conv.Audit.StreamingStats.ShardToDataflowJobMap {
+		err := CleanupDataflowJob(ctx, c, dfId, projectID, region)
+		if err != nil {
+			fmt.Printf("Cleanup of the dataflow job: %s was unsuccessful, please clean up the job manually", dfId)
+		}
+	}
+	for _, dsName := range conv.Audit.StreamingStats.ShardToDataStreamNameMap {
+		err := CleanupDatastream(ctx, dsClient, dsName, projectID, region)
+		if err != nil {
+			fmt.Printf("Cleanup of the datastream: %s was unsuccessful, please clean up the stream manually", dsName)
+		}
+	}
+	fmt.Println("Clean up complete")
+	return nil
+}
+
+func CleanupDatastream(ctx context.Context, client *datastream.Client, dsName string, projectID, region string) error {
+	req := &datastreampb.DeleteStreamRequest{
+		Name: fmt.Sprintf("projects/%s/locations/%s/streams/%s", projectID, region, dsName),
+	}
+	_, err := client.DeleteStream(ctx, req)
+	if err != nil {
+		return fmt.Errorf("error while deleting datastream job: %v", err)
+	}
+	return nil
+}
+
+func CleanupDataflowJob(ctx context.Context, client *dataflow.JobsV1Beta3Client, dataflowJobId string, projectID, region string) error {
 	job := &dataflowpb.Job{
-		Id:             conv.Audit.StreamingStats.DataflowJobId,
+		Id:             dataflowJobId,
 		ProjectId:      projectID,
 		RequestedState: dataflowpb.JobState_JOB_STATE_CANCELLED,
 	}
 
 	dfReq := &dataflowpb.UpdateJobRequest{
 		ProjectId: projectID,
-		JobId:     conv.Audit.StreamingStats.DataflowJobId,
+		JobId:     dataflowJobId,
 		Location:  region,
 		Job:       job,
 	}
-	_, err = c.UpdateJob(ctx, dfReq)
+	_, err := client.UpdateJob(ctx, dfReq)
 	if err != nil {
 		fmt.Println(err)
 		return fmt.Errorf("error while cancelling dataflow job: %v", err)
-	}
-	dsClient, err := datastream.NewClient(ctx)
-	if err != nil {
-		return fmt.Errorf("datastream client can not be created: %v", err)
-	}
-	defer dsClient.Close()
-	req := &datastreampb.DeleteStreamRequest{
-		Name: fmt.Sprintf("projects/%s/locations/%s/streams/%s", projectID, region, conv.Audit.StreamingStats.DataStreamName),
-	}
-	_, err = dsClient.DeleteStream(ctx, req)
-	if err != nil {
-		return fmt.Errorf("error while deleting datastream job: %v", err)
 	}
 	return nil
 }
@@ -365,28 +439,32 @@ func LaunchDataflowJob(ctx context.Context, targetProfile profiles.TargetProfile
 		inputFilePattern = inputFilePattern + "/"
 	}
 	fmt.Println("Reading files from datastream destination ", inputFilePattern)
-
-	launchParameter := &dataflowpb.LaunchFlexTemplateParameter{
-		JobName:  dataflowCfg.JobName,
-		Template: &dataflowpb.LaunchFlexTemplateParameter_ContainerSpecGcsPath{ContainerSpecGcsPath: "gs://dataflow-templates-southamerica-west1/2022-12-13-00_RC01/flex/Cloud_Datastream_to_Spanner"},
-		Parameters: map[string]string{
-			"inputFilePattern":         inputFilePattern,
-			"streamName":               fmt.Sprintf("projects/%s/locations/%s/streams/%s", project, datastreamCfg.StreamLocation, datastreamCfg.StreamId),
-			"instanceId":               instance,
-			"databaseId":               dbName,
-			"sessionFilePath":          streamingCfg.TmpDir + "session.json",
-			"deadLetterQueueDirectory": inputFilePattern + "dlq",
-		},
-		Environment: &dataflowpb.FlexTemplateRuntimeEnvironment{
-			MaxWorkers:            maxWorkers,
-			AutoscalingAlgorithm:  2, // 2 corresponds to AUTOSCALING_ALGORITHM_BASIC
-			EnableStreamingEngine: true,
-		},
+	var dataflowHostProjectId string
+	if dataflowCfg.HostProjectId == "" {
+		dataflowHostProjectId, _ = utils.GetProject()
+	} else {
+		dataflowHostProjectId = dataflowCfg.HostProjectId
 	}
+
+	dataflowSubnetwork := ""
+
+	// If custom network is not selected, use public IP. Typical for internal testing flow.
+	workerIpAddressConfig := dataflowpb.WorkerIPAddressConfiguration_WORKER_IP_PUBLIC
+
+	if dataflowCfg.Network != "" {
+		workerIpAddressConfig = dataflowpb.WorkerIPAddressConfiguration_WORKER_IP_PRIVATE
+		if dataflowCfg.Subnetwork == "" {
+			return fmt.Errorf("if network is specified, subnetwork cannot be empty")
+		} else {
+			dataflowSubnetwork = fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/regions/%s/subnetworks/%s", dataflowHostProjectId, dataflowCfg.Location, dataflowCfg.Subnetwork)
+		}
+	}
+
+	launchParameters := createLaunchParameters(dataflowCfg, inputFilePattern, project, datastreamCfg, instance, dbName, streamingCfg, dataflowSubnetwork, workerIpAddressConfig)
 
 	req := &dataflowpb.LaunchFlexTemplateRequest{
 		ProjectId:       project,
-		LaunchParameter: launchParameter,
+		LaunchParameter: launchParameters,
 		Location:        dataflowCfg.Location,
 	}
 	fmt.Println("Created flex template request body...")
@@ -396,49 +474,126 @@ func LaunchDataflowJob(ctx context.Context, targetProfile profiles.TargetProfile
 		fmt.Printf("flexTemplateRequest: %+v\n", req)
 		return fmt.Errorf("unable to launch template: %v", err)
 	}
+	storeGeneratedResources(conv, datastreamCfg, respDf, project, streamingCfg.DataShardId)
+	return nil
+}
+
+func storeGeneratedResources(conv *internal.Conv, datastreamCfg DatastreamCfg, respDf *dataflowpb.LaunchFlexTemplateResponse, project string, dataShardId string) {
 	conv.Audit.StreamingStats.DataStreamName = datastreamCfg.StreamId
 	conv.Audit.StreamingStats.DataflowJobId = respDf.Job.Id
+	if dataShardId != "" {
+		var resourceMutex sync.Mutex
+		resourceMutex.Lock()
+		conv.Audit.StreamingStats.ShardToDataStreamNameMap[dataShardId] = datastreamCfg.StreamId
+		conv.Audit.StreamingStats.ShardToDataflowJobMap[dataShardId] = respDf.Job.Id
+		resourceMutex.Unlock()
+	}
 	fullStreamName := fmt.Sprintf("projects/%s/locations/%s/streams/%s", project, datastreamCfg.StreamLocation, datastreamCfg.StreamId)
 	dfJobDetails := fmt.Sprintf("project: %s, location: %s, name: %s, id: %s", project, respDf.Job.Location, respDf.Job.Name, respDf.Job.Id)
 	fmt.Println("\n------------------------------------------\n" +
 		"The Datastream job: " + fullStreamName + "and the Dataflow job: " + dfJobDetails +
 		" will have to be manually cleaned up via the UI. HarbourBridge will not delete them post completion of the migration.")
-	return nil
 }
 
-func getStreamingConfig(sourceProfile profiles.SourceProfile, targetProfile profiles.TargetProfile) (StreamingCfg, error) {
+func createLaunchParameters(dataflowCfg DataflowCfg, inputFilePattern string, project string, datastreamCfg DatastreamCfg, instance string, dbName string, streamingCfg StreamingCfg, dataflowSubnetwork string, workerIpAddressConfig dataflowpb.WorkerIPAddressConfiguration) *dataflowpb.LaunchFlexTemplateParameter {
+	return &dataflowpb.LaunchFlexTemplateParameter{
+		JobName:  dataflowCfg.JobName,
+		Template: &dataflowpb.LaunchFlexTemplateParameter_ContainerSpecGcsPath{ContainerSpecGcsPath: "gs://dataflow-templates-southamerica-west1/2023-07-04-00_RC00/flex/Cloud_Datastream_to_Spanner"},
+		Parameters: map[string]string{
+			"inputFilePattern":              inputFilePattern,
+			"streamName":                    fmt.Sprintf("projects/%s/locations/%s/streams/%s", project, datastreamCfg.StreamLocation, datastreamCfg.StreamId),
+			"instanceId":                    instance,
+			"databaseId":                    dbName,
+			"sessionFilePath":               streamingCfg.TmpDir + "session.json",
+			"deadLetterQueueDirectory":      inputFilePattern + "dlq",
+			"transformationContextFilePath": streamingCfg.TmpDir + "transformationContext.json",
+		},
+		Environment: &dataflowpb.FlexTemplateRuntimeEnvironment{
+			MaxWorkers:            maxWorkers,
+			AutoscalingAlgorithm:  2, // 2 corresponds to AUTOSCALING_ALGORITHM_BASIC
+			EnableStreamingEngine: true,
+			Network:               dataflowCfg.Network,
+			Subnetwork:            dataflowSubnetwork,
+			IpConfiguration:       workerIpAddressConfig,
+		},
+	}
+}
+
+func getStreamingConfig(sourceProfile profiles.SourceProfile, targetProfile profiles.TargetProfile, tableList []string) (StreamingCfg, error) {
 	switch sourceProfile.Conn.Ty {
 	case profiles.SourceProfileConnectionTypeMySQL:
-		return ReadStreamingConfig(sourceProfile.Conn.Mysql.StreamingConfig, targetProfile.Conn.Sp.Dbname)
+		return ReadStreamingConfig(sourceProfile.Conn.Mysql.StreamingConfig, targetProfile.Conn.Sp.Dbname, tableList)
 	case profiles.SourceProfileConnectionTypeOracle:
-		return ReadStreamingConfig(sourceProfile.Conn.Oracle.StreamingConfig, targetProfile.Conn.Sp.Dbname)
+		return ReadStreamingConfig(sourceProfile.Conn.Oracle.StreamingConfig, targetProfile.Conn.Sp.Dbname, tableList)
 	case profiles.SourceProfileConnectionTypePostgreSQL:
-		return ReadStreamingConfig(sourceProfile.Conn.Pg.StreamingConfig, targetProfile.Conn.Sp.Dbname)
+		return ReadStreamingConfig(sourceProfile.Conn.Pg.StreamingConfig, targetProfile.Conn.Sp.Dbname, tableList)
 	default:
 		return StreamingCfg{}, fmt.Errorf("only MySQL, Oracle and PostgreSQL are supported as source streams")
 	}
 }
 
-func StartDatastream(ctx context.Context, sourceProfile profiles.SourceProfile, targetProfile profiles.TargetProfile) (StreamingCfg, error) {
-	streamingCfg, err := getStreamingConfig(sourceProfile, targetProfile)
+func CreateStreamingConfig(pl profiles.DataShard) StreamingCfg {
+	//create dataflowcfg from pl receiver object
+	inputDataflowConfig := pl.DataflowConfig
+	dataflowCfg := DataflowCfg{Location: inputDataflowConfig.Location,
+		Network:       inputDataflowConfig.Network,
+		HostProjectId: inputDataflowConfig.HostProjectId,
+		Subnetwork:    inputDataflowConfig.Subnetwork}
+	//create src and dst datastream from pl receiver object
+	datastreamCfg := DatastreamCfg{StreamLocation: pl.StreamLocation}
+	//set src connection profile
+	inputSrcConnProfile := pl.SrcConnectionProfile
+	srcConnCfg := SrcConnCfg{Location: inputSrcConnProfile.Location, Name: inputSrcConnProfile.Name}
+	datastreamCfg.SourceConnectionConfig = srcConnCfg
+	//set dst connection profile
+	inputDstConnProfile := pl.DstConnectionProfile
+	dstConnCfg := DstConnCfg{Name: inputDstConnProfile.Name, Location: inputDstConnProfile.Location}
+	datastreamCfg.DestinationConnectionConfig = dstConnCfg
+	//create the streamingCfg object
+	streamingCfg := StreamingCfg{DataflowCfg: dataflowCfg, DatastreamCfg: datastreamCfg, TmpDir: pl.TmpDir, DataShardId: pl.DataShardId}
+	return streamingCfg
+}
+
+func StartDatastream(ctx context.Context, sourceProfile profiles.SourceProfile, targetProfile profiles.TargetProfile, tableList []string) (StreamingCfg, error) {
+	streamingCfg, err := getStreamingConfig(sourceProfile, targetProfile, tableList)
 	if err != nil {
 		return streamingCfg, fmt.Errorf("error reading streaming config: %v", err)
 	}
-
-	err = LaunchStream(ctx, sourceProfile, targetProfile.Conn.Sp.Project, streamingCfg.DatastreamCfg)
+	driver := sourceProfile.Driver
+	var dbList []profiles.LogicalShard
+	switch driver {
+	case constants.MYSQL:
+		dbList = append(dbList, profiles.LogicalShard{DbName: sourceProfile.Conn.Mysql.Db})
+	case constants.ORACLE:
+		dbList = append(dbList, profiles.LogicalShard{DbName: sourceProfile.Conn.Oracle.User})
+	case constants.POSTGRES:
+		dbList = append(dbList, profiles.LogicalShard{DbName: streamingCfg.DatastreamCfg.Properties})
+	}
+	err = LaunchStream(ctx, sourceProfile, dbList, targetProfile.Conn.Sp.Project, streamingCfg.DatastreamCfg)
 	if err != nil {
 		return streamingCfg, fmt.Errorf("error launching stream: %v", err)
 	}
 	return streamingCfg, nil
 }
 
-func StartDataflow(ctx context.Context, sourceProfile profiles.SourceProfile, targetProfile profiles.TargetProfile, streamingCfg StreamingCfg, conv *internal.Conv) error {
+func StartDataflow(ctx context.Context, targetProfile profiles.TargetProfile, streamingCfg StreamingCfg, conv *internal.Conv) error {
 
 	convJSON, err := json.MarshalIndent(conv, "", " ")
 	if err != nil {
 		return fmt.Errorf("can't encode session state to JSON: %v", err)
 	}
 	err = utils.WriteToGCS(streamingCfg.TmpDir, "session.json", string(convJSON))
+	if err != nil {
+		return fmt.Errorf("error while writing to GCS: %v", err)
+	}
+	transformationContextMap := map[string]interface{}{
+		"SchemaToShardId": streamingCfg.DataflowCfg.DbNameToShardIdMap,
+	}
+	transformationContext, err := json.Marshal(transformationContextMap)
+	if err != nil {
+		return fmt.Errorf("failed to compute transformation context: %s", err.Error())
+	}
+	err = utils.WriteToGCS(streamingCfg.TmpDir, "transformationContext.json", string(transformationContext))
 	if err != nil {
 		return fmt.Errorf("error while writing to GCS: %v", err)
 	}

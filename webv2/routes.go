@@ -37,14 +37,20 @@ func getRoutes() *mux.Router {
 	router.HandleFunc("/convert/dump", convertSchemaDump).Methods("POST")
 	router.HandleFunc("/convert/session", loadSession).Methods("POST")
 	router.HandleFunc("/ddl", getDDL).Methods("GET")
-	router.HandleFunc("/overview", getOverview).Methods("GET")
 	router.HandleFunc("/conversion", getConversionRate).Methods("GET")
 	router.HandleFunc("/typemap", getTypeMap).Methods("GET")
 	router.HandleFunc("/report", getReportFile).Methods("GET")
+	router.HandleFunc("/downloadStructuredReport", getDStructuredReport).Methods("GET")
+	router.HandleFunc("/downloadTextReport", getDTextReport).Methods("GET")
+	router.HandleFunc("/downloadDDL", getDSpannerDDL).Methods("GET")
 	router.HandleFunc("/schema", getSchemaFile).Methods("GET")
-	router.HandleFunc("/typemap/global", setTypeMapGlobal).Methods("POST")
+	router.HandleFunc("/applyrule", applyRule).Methods("POST")
+	router.HandleFunc("/dropRule", dropRule).Methods("POST")
 	router.HandleFunc("/typemap/table", table.UpdateTableSchema).Methods("POST")
 	router.HandleFunc("/typemap/reviewTableSchema", table.ReviewTableSchema).Methods("POST")
+	router.HandleFunc("/typemap/GetStandardTypeToPGSQLTypemap", getStandardTypeToPGSQLTypemap).Methods("GET")
+	router.HandleFunc("/typemap/GetPGSQLToStandardTypeTypemap", getPGSQLToStandardTypeTypemap).Methods("GET")
+	router.HandleFunc("/spannerDefaultTypeMap", spannerDefaultTypeMap).Methods("GET")
 
 	router.HandleFunc("/setparent", setParentTable).Methods("GET")
 	router.HandleFunc("/removeParent", removeParentTable).Methods("POST")
@@ -54,16 +60,15 @@ func getRoutes() *mux.Router {
 	router.HandleFunc("/restore/secondaryIndex", restoreSecondaryIndex).Methods("POST")
 
 	router.HandleFunc("/restore/table", restoreTable).Methods("POST")
+	router.HandleFunc("/restore/tables", restoreTables).Methods("POST")
 	router.HandleFunc("/drop/table", dropTable).Methods("POST")
+	router.HandleFunc("/drop/tables", dropTables).Methods("POST")
 
 	router.HandleFunc("/update/fks", updateForeignKeys).Methods("POST")
-	router.HandleFunc("/rename/indexes", renameIndexes).Methods("POST")
-	router.HandleFunc("/add/indexes", addIndexes).Methods("POST")
 	router.HandleFunc("/update/indexes", updateIndexes).Methods("POST")
 
 	// Session Management
 	router.HandleFunc("/IsOffline", session.IsOfflineSession).Methods("GET")
-	router.HandleFunc("/InitiateSession", session.InitiateSession).Methods("POST")
 	router.HandleFunc("/GetSessions", session.GetSessions).Methods("GET")
 	router.HandleFunc("/GetSession/{versionId}", session.GetConv).Methods("GET")
 	router.HandleFunc("/SaveRemoteSession", session.SaveRemoteSession).Methods("POST")
@@ -71,6 +76,8 @@ func getRoutes() *mux.Router {
 
 	// primarykey
 	router.HandleFunc("/primaryKey", primarykey.PrimaryKey).Methods("POST")
+
+	router.HandleFunc("/AddColumn", table.AddNewColumn).Methods("POST")
 
 	// Summary
 	router.HandleFunc("/summary", summary.GetSummary).Methods("GET")
@@ -97,8 +104,13 @@ func getRoutes() *mux.Router {
 
 	router.HandleFunc("/SetSourceDBDetailsForDump", setSourceDBDetailsForDump).Methods("POST")
 	router.HandleFunc("/SetSourceDBDetailsForDirectConnect", setSourceDBDetailsForDirectConnect).Methods("POST")
-
+	router.HandleFunc("/SetShardsSourceDBDetailsForBulk", setShardsSourceDBDetailsForBulk).Methods("POST")
+	router.HandleFunc("/SetShardsSourceDBDetailsForDataflow", setShardsSourceDBDetailsForDataflow).Methods("POST")
+	router.HandleFunc("/SetDataflowDetailsForShardedMigrations", setDataflowDetailsForShardedMigrations).Methods("POST")
+	router.HandleFunc("/GetSourceProfileConfig", getSourceProfileConfig).Methods("GET")
 	router.HandleFunc("/uploadFile", uploadFile).Methods("POST")
+
+	router.HandleFunc("/GetTableWithErrors", getTableWithErrors).Methods("GET")
 
 	router.PathPrefix("/").Handler(frontendStatic)
 	return router

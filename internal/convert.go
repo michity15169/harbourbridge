@@ -23,27 +23,42 @@ import (
 	"github.com/cloudspannerecosystem/harbourbridge/schema"
 	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
 	"go.uber.org/zap"
+	"google.golang.org/genproto/googleapis/type/datetime"
 )
 
 // Conv contains all schema and data conversion state.
 type Conv struct {
-	mode           mode                                // Schema mode or data mode.
-	SpSchema       ddl.Schema                          // Maps Spanner table name to Spanner schema.
-	SyntheticPKeys map[string]SyntheticPKey            // Maps Spanner table name to synthetic primary key (if needed).
-	SrcSchema      map[string]schema.Table             // Maps source-DB table name to schema information.
-	Issues         map[string]map[string][]SchemaIssue // Maps source-DB table/col to list of schema conversion issues.
-	ToSpanner      map[string]NameAndCols              // Maps from source-DB table name to Spanner name and column mapping.
-	ToSource       map[string]NameAndCols              // Maps from Spanner table name to source-DB table name and column mapping.
-	UsedNames      map[string]bool                     // Map storing the names that are already assigned to tables, indices or foreign key contraints.
+	mode           mode                     // Schema mode or data mode.
+	SpSchema       ddl.Schema               // Maps Spanner table name to Spanner schema.
+	SyntheticPKeys map[string]SyntheticPKey // Maps Spanner table name to synthetic primary key (if needed).
+	SrcSchema      map[string]schema.Table  // Maps source-DB table name to schema information.
+	SchemaIssues   map[string]TableIssues   // Maps source-DB table/col to list of schema conversion issues.
+	ToSpanner      map[string]NameAndCols   `json:"-"` // Maps from source-DB table name to Spanner name and column mapping.
+	ToSource       map[string]NameAndCols   `json:"-"` // Maps from Spanner table name to source-DB table name and column mapping.
+	UsedNames      map[string]bool          `json:"-"` // Map storing the names that are already assigned to tables, indices or foreign key contraints.
 	dataSink       func(table string, cols []string, values []interface{})
-	DataFlush      func()         `json:"-"` // Data flush is used to flush out remaining writes and wait for them to complete.
-	Location       *time.Location // Timezone (for timestamp conversion).
-	sampleBadRows  rowSamples     // Rows that generated errors during conversion.
-	Stats          stats
+	DataFlush      func()              `json:"-"` // Data flush is used to flush out remaining writes and wait for them to complete.
+	Location       *time.Location      // Timezone (for timestamp conversion).
+	sampleBadRows  rowSamples          // Rows that generated errors during conversion.
+	Stats          stats               `json:"-"`
 	TimezoneOffset string              // Timezone offset for timestamp conversion.
-	TargetDb       string              // The target database to which HarbourBridge is writing.
+	SpDialect      string              // The dialect of the spanner database to which HarbourBridge is writing.
 	UniquePKey     map[string][]string // Maps Spanner table name to unique column name being used as primary key (if needed).
-	Audit          Audit               // Stores the audit information for the database conversion
+	Audit          Audit               `json:"-"` // Stores the audit information for the database conversion
+	Rules          []Rule              // Stores applied rules during schema conversion
+}
+
+type TableIssues struct {
+	ColumnLevelIssues map[string][]SchemaIssue
+	TableLevelIssues  []SchemaIssue
+}
+
+type AdditionalSchemaAttributes struct {
+	IsSharded bool
+}
+
+type AdditionalDataAttributes struct {
+	ShardId string
 }
 
 type mode int
@@ -57,7 +72,7 @@ const (
 // count for a table, if needed. We use a synthetic primary key when
 // the source DB table has no primary key.
 type SyntheticPKey struct {
-	Col      string
+	ColId    string
 	Sequence int64
 }
 
@@ -94,6 +109,15 @@ const (
 	InterleavedAddColumn
 	IllegalName
 	InterleavedRenameColumn
+	InterleavedChangeColumnSize
+	RowLimitExceeded
+	ShardIdColumnAdded
+	ShardIdColumnPrimaryKey
+)
+
+const (
+	ShardIdColumn       = "migration_shard_id"
+	SyntheticPrimaryKey = "synth_id"
 )
 
 // NameAndCols contains the name of a table and its columns.
@@ -147,8 +171,6 @@ type statementStat struct {
 // Stores the audit information of conversion.
 // Elements that do not affect the migration functionality but are relevant for the migration metadata.
 type Audit struct {
-	ToSpannerFkIdx           map[string]FkeyAndIdxs                 // Maps from source-DB table name to Spanner names for table name, foreign key and indexes.
-	ToSourceFkIdx            map[string]FkeyAndIdxs                 // Maps from Spanner table name to source-DB names for table name, foreign key and indexes.
 	SchemaConversionDuration time.Duration                          `json:"-"` // Duration of schema conversion.
 	DataConversionDuration   time.Duration                          `json:"-"` // Duration of data conversion.
 	MigrationRequestId       string                                 `json:"-"` // Unique request id generated per migration
@@ -156,18 +178,37 @@ type Audit struct {
 	DryRun                   bool                                   `json:"-"` // Flag to identify if the migration is a dry run.
 	StreamingStats           streamingStats                         `json:"-"` // Stores information related to streaming migration process.
 	Progress                 Progress                               `json:"-"` // Stores information related to progress of the migration progress
+	SkipMetricsPopulation    bool                                   `json:"-"` // Flag to identify if outgoing metrics metadata needs to skipped
 }
 
 // Stores information related to the streaming migration process.
 type streamingStats struct {
-	Streaming        bool                        // Flag for confirmation of streaming migration.
-	TotalRecords     map[string]map[string]int64 // Tablewise count of records received for processing, broken down by record type i.e. INSERT, MODIFY & REMOVE.
-	BadRecords       map[string]map[string]int64 // Tablewise count of records not converted successfully, broken down by record type.
-	DroppedRecords   map[string]map[string]int64 // Tablewise count of records successfully converted but failed to written on Spanner, broken down by record type.
-	SampleBadRecords []string                    // Records that generated errors during conversion.
-	SampleBadWrites  []string                    // Records that faced errors while writing to Cloud Spanner.
-	DataStreamName   string
-	DataflowJobId    string
+	Streaming                bool                        // Flag for confirmation of streaming migration.
+	TotalRecords             map[string]map[string]int64 // Tablewise count of records received for processing, broken down by record type i.e. INSERT, MODIFY & REMOVE.
+	BadRecords               map[string]map[string]int64 // Tablewise count of records not converted successfully, broken down by record type.
+	DroppedRecords           map[string]map[string]int64 // Tablewise count of records successfully converted but failed to written on Spanner, broken down by record type.
+	SampleBadRecords         []string                    // Records that generated errors during conversion.
+	SampleBadWrites          []string                    // Records that faced errors while writing to Cloud Spanner.
+	DataStreamName           string
+	DataflowJobId            string
+	ShardToDataStreamNameMap map[string]string
+	ShardToDataflowJobMap    map[string]string
+}
+
+// Stores information related to rules during schema conversion
+type Rule struct {
+	Id                string
+	Name              string
+	Type              string
+	ObjectType        string
+	AssociatedObjects string
+	Enabled           bool
+	Data              interface{}
+	AddedOn           datetime.DateTime
+}
+
+type Tables struct {
+	TableList []string `json:"TableList"`
 }
 
 // MakeConv returns a default-configured Conv.
@@ -176,7 +217,7 @@ func MakeConv() *Conv {
 		SpSchema:       ddl.NewSchema(),
 		SyntheticPKeys: make(map[string]SyntheticPKey),
 		SrcSchema:      make(map[string]schema.Table),
-		Issues:         make(map[string]map[string][]SchemaIssue),
+		SchemaIssues:   make(map[string]TableIssues),
 		ToSpanner:      make(map[string]NameAndCols),
 		ToSource:       make(map[string]NameAndCols),
 		UsedNames:      make(map[string]bool),
@@ -192,11 +233,10 @@ func MakeConv() *Conv {
 		TimezoneOffset: "+00:00", // By default, use +00:00 offset which is equal to UTC timezone
 		UniquePKey:     make(map[string][]string),
 		Audit: Audit{
-			ToSpannerFkIdx: make(map[string]FkeyAndIdxs),
-			ToSourceFkIdx:  make(map[string]FkeyAndIdxs),
 			StreamingStats: streamingStats{},
 			MigrationType:  migration.MigrationData_SCHEMA_ONLY.Enum(),
 		},
+		Rules: []Rule{},
 	}
 }
 
@@ -322,11 +362,27 @@ func (conv *Conv) SampleBadRows(n int) []string {
 	return l
 }
 
+func (conv *Conv) AddShardIdColumn() {
+	for t, ct := range conv.SpSchema {
+		if ct.ShardIdColumn == "" {
+			colName := conv.buildColumnNameWithBase(t, ShardIdColumn)
+			columnId := GenerateColumnId()
+			ct.ColIds = append(ct.ColIds, columnId)
+			ct.ColDefs[columnId] = ddl.ColumnDef{Name: colName, Id: columnId, T: ddl.Type{Name: ddl.String, Len: 50}, NotNull: false}
+			ct.ShardIdColumn = columnId
+			conv.SpSchema[t] = ct
+			var issues []SchemaIssue
+			issues = append(issues, ShardIdColumnAdded, ShardIdColumnPrimaryKey)
+			conv.SchemaIssues[ct.Id].ColumnLevelIssues[columnId] = issues
+		}
+	}
+}
+
 // AddPrimaryKeys analyzes all tables in conv.schema and adds synthetic primary
 // keys for any tables that don't have primary key.
 func (conv *Conv) AddPrimaryKeys() {
 	for t, ct := range conv.SpSchema {
-		if len(ct.Pks) == 0 {
+		if len(ct.PrimaryKeys) == 0 {
 			primaryKeyPopulated := false
 			// Populating column with unique constraint as primary key in case
 			// table doesn't have primary key and removing the unique index.
@@ -334,8 +390,8 @@ func (conv *Conv) AddPrimaryKeys() {
 				for i, index := range ct.Indexes {
 					if index.Unique {
 						for _, indexKey := range index.Keys {
-							ct.Pks = append(ct.Pks, ddl.IndexKey{Col: indexKey.Col, Desc: indexKey.Desc})
-							conv.UniquePKey[t] = append(conv.UniquePKey[t], indexKey.Col)
+							ct.PrimaryKeys = append(ct.PrimaryKeys, ddl.IndexKey{ColId: indexKey.ColId, Desc: indexKey.Desc, Order: indexKey.Order})
+							conv.UniquePKey[t] = append(conv.UniquePKey[t], indexKey.ColId)
 						}
 						primaryKeyPopulated = true
 						ct.Indexes = append(ct.Indexes[:i], ct.Indexes[i+1:]...)
@@ -344,11 +400,12 @@ func (conv *Conv) AddPrimaryKeys() {
 				}
 			}
 			if !primaryKeyPopulated {
-				k := conv.buildPrimaryKey(t)
-				ct.ColNames = append(ct.ColNames, k)
-				ct.ColDefs[k] = ddl.ColumnDef{Name: k, T: ddl.Type{Name: ddl.String, Len: 50}}
-				ct.Pks = []ddl.IndexKey{{Col: k}}
-				conv.SyntheticPKeys[t] = SyntheticPKey{k, 0}
+				k := conv.buildColumnNameWithBase(t, SyntheticPrimaryKey)
+				columnId := GenerateColumnId()
+				ct.ColIds = append(ct.ColIds, columnId)
+				ct.ColDefs[columnId] = ddl.ColumnDef{Name: k, Id: columnId, T: ddl.Type{Name: ddl.String, Len: 50}}
+				ct.PrimaryKeys = []ddl.IndexKey{{ColId: columnId, Order: 1}}
+				conv.SyntheticPKeys[t] = SyntheticPKey{columnId, 0}
 			}
 			conv.SpSchema[t] = ct
 		}
@@ -360,17 +417,23 @@ func (conv *Conv) SetLocation(loc *time.Location) {
 	conv.Location = loc
 }
 
-func (conv *Conv) buildPrimaryKey(spTable string) string {
-	base := "synth_id"
-	if _, ok := conv.ToSource[spTable]; !ok {
-		conv.Unexpected(fmt.Sprintf("ToSource lookup fails for table %s: ", spTable))
+func (conv *Conv) buildColumnNameWithBase(tableId, base string) string {
+	if _, ok := conv.SpSchema[tableId]; !ok {
+		conv.Unexpected(fmt.Sprintf("Table doesn't exist for tableId %s: ", tableId))
 		return base
 	}
 	count := 0
 	key := base
 	for {
 		// Check key isn't already a column in the table.
-		if _, ok := conv.ToSource[spTable].Cols[key]; !ok {
+		ok := true
+		for _, column := range conv.SpSchema[tableId].ColDefs {
+			if column.Name == key {
+				ok = false
+				break
+			}
+		}
+		if ok {
 			return key
 		}
 		key = fmt.Sprintf("%s%d", base, count)

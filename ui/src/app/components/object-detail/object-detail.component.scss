@@ -1,6 +1,9 @@
 .no-table-selected {
   height: 90%;
   background-color: white;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-around;
 }
 
 .select-table-message {
@@ -17,10 +20,7 @@
 .title_container {
   display: flex;
   justify-content: space-between;
-  flex-direction: column;
-  align-items: flex-start;
-  justify-content: left;
-  padding: 10px 20px;
+  padding: 10px 0px 10px 20px;
   border-bottom: 1px solid #cccccc;
   .title {
     display: flex;
@@ -47,7 +47,7 @@
     }
   }
 }
-.interleave-parent-table{
+.interleave-parent-table {
   font-weight: bold;
 }
 
@@ -129,10 +129,9 @@
     border: 1px solid #f5f5f5;
     padding: 7px 5px;
     width: auto;
-
   }
   input.ng-invalid.ng-touched {
-  border: 1px solid red;
+    border: 1px solid red;
   }
 
   .order_input {
@@ -181,7 +180,9 @@
   .mat-column-srcDataType,
   .mat-column-spDataType,
   .mat-column-spIndexColName,
-  .mat-column-srcIndexColName {
+  .mat-column-srcIndexColName,
+  .mat-column-spColMaxLength,
+  .mat-column-srcColMaxLength {
     min-width: 100px;
   }
 
@@ -208,7 +209,6 @@
     .material-icons {
       font-size: 18px;
     }
-    
 
     .sp-datatype-suggestion-icon {
       margin-right: 5px;
@@ -271,5 +271,9 @@ p {
   margin-right: 10px;
 }
 .scr-column-data-edit-mode {
-  height: 58.3px;
+  height: 58.3px !important;
+}
+
+tr.mat-row {
+  height: 58px;
 }

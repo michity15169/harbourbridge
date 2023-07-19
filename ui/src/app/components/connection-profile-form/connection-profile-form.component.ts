@@ -2,7 +2,7 @@ import { Component, Inject, OnInit } from '@angular/core';
 import { FormBuilder, FormGroup, Validators } from '@angular/forms';
 import { MatDialogRef, MAT_DIALOG_DATA } from '@angular/material/dialog';
 import { MigrationDetails, Profile, TargetDetails } from 'src/app/app.constants';
-import IConnectionProfile, { ICreateConnectionProfile, ISetUpConnectionProfile } from 'src/app/model/profile';
+import IConnectionProfile, { ICreateConnectionProfile, ICreateConnectionProfileV2, ISetUpConnectionProfile } from 'src/app/model/profile';
 import { FetchService } from 'src/app/services/fetch/fetch.service';
 import { SnackbarService } from 'src/app/services/snackbar/snackbar.service';
 
@@ -27,6 +27,7 @@ export class ConnectionProfileFormComponent implements OnInit {
   isSource: boolean = false
   sourceDatabaseType: string = ''
   testSuccess: boolean = false
+  testingSourceConnection: boolean = false
   constructor(
     private fetch: FetchService,
     private snack: SnackbarService,
@@ -70,6 +71,7 @@ export class ConnectionProfileFormComponent implements OnInit {
     }
   }
   testConnection() {
+    this.testingSourceConnection = true
     let formValue = this.connectionProfileForm.value
     let payload: ICreateConnectionProfile = {
       Id: formValue.newProfile,
@@ -78,11 +80,12 @@ export class ConnectionProfileFormComponent implements OnInit {
     }
     this.fetch.createConnectionProfile(payload).subscribe({
       next: () => {
+        this.testingSourceConnection = false
         this.testSuccess = true
       },
       error: (err: any) => {
+        this.testingSourceConnection = false
         this.testSuccess = false
-        console.log(err)
         this.errorMsg = err
       },
     })
@@ -94,7 +97,7 @@ export class ConnectionProfileFormComponent implements OnInit {
       localStorage.setItem(TargetDetails.Publication, formValue.publication)
     }
     if (this.selectedOption === Profile.NewConnProfile) {
-      let payload: ICreateConnectionProfile = {
+      let payload: ICreateConnectionProfileV2 = {
         Id: formValue.newProfile,
         IsSource: this.isSource,
         ValidateOnly: false

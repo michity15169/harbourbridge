@@ -1,8 +1,11 @@
+import IRule from './rule'
+
 export default interface IConv {
   SpSchema: Record<string, ICreateTable>
   SyntheticPKeys: Record<string, ISyntheticPKey>
   SrcSchema: Record<string, ITable>
-  Issues: Record<string, number>[]
+  SchemaIssues: Record<string, number>[]
+  Rules: IRule[]
   ToSpanner: Record<string, NameAndCols>
   ToSource: Record<string, NameAndCols>
   UsedNames: Record<string, boolean>
@@ -13,12 +16,7 @@ export default interface IConv {
   DatabaseType: string
   DatabaseName: string
   EditorName: string
-  Audit: IAudit
-}
-
-export interface IAudit {
-  ToSpannerFkIdx: Record<string, IFkeyAndIdxs>
-  ToSourceFkIdx: Record<string, IFkeyAndIdxs>
+  SpDialect: string
 }
 
 export interface IFkeyAndIdxs {
@@ -45,7 +43,7 @@ export interface ITable {
   Name: string
   Id: string
   Schema: string
-  ColNames: string[]
+  ColIds: string[]
   ColDefs: Record<string, IColumn>
   PrimaryKeys: ISrcIndexKey[]
   ForeignKeys: ISpannerForeignKey[]
@@ -84,9 +82,9 @@ export interface IIndex {
 
 export interface ISpannerForeignKey {
   Name: string
-  Columns: string[]
-  ReferTable: string
-  ReferColumns: string[]
+  ColIds: string[]
+  ReferTableId: string
+  ReferColumnIds: string[]
   OnDelete: string
   OnUpdate: string
   Id: string
@@ -95,19 +93,20 @@ export interface ISpannerForeignKey {
 // source schema
 export interface ICreateTable {
   Name: string
-  ColNames: string[]
+  ColIds: string[]
+  ShardIdColumn: string
   ColDefs: Record<string, IColumnDef>
-  Pks: IIndexKey[]
-  Fks: IForeignKey[]
+  PrimaryKeys: IIndexKey[]
+  ForeignKeys: IForeignKey[]
   Indexes: ICreateIndex[]
-  Parent: string
+  ParentId: string
   Comment: string
   Id: string
 }
 
 export interface ICreateIndex {
   Name: string
-  Table: string
+  TableId: string
   Unique: boolean
   Keys: IIndexKey[]
   Id: string
@@ -115,20 +114,20 @@ export interface ICreateIndex {
 
 export interface IForeignKey {
   Name: string
-  Columns: string[]
-  ReferTable: string
-  ReferColumns: string[]
-  Id: string
+  ColIds: string[]
+  ReferTableId: string
+  ReferColumnIds: string[]
+  Id: string | undefined
 }
 
 export interface IIndexKey {
-  Col: string
+  ColId: string
   Desc: boolean
   Order: number
 }
 
 export interface ISrcIndexKey {
-  Column: string
+  ColId: string
   Desc: boolean
   Order: number
 }
@@ -148,7 +147,7 @@ export interface IType {
 }
 
 export interface ISyntheticPKey {
-  Col: string
+  ColId: string
   Sequence: Number
 }
 export interface ITableInterleaveStatus {
@@ -168,7 +167,6 @@ export interface IPrimaryKey {
 
 export interface IPkColumnDefs {
   ColumnId: string
-  ColName: string
   Desc: boolean
   Order: number
 }
@@ -186,9 +184,17 @@ export interface ISessionSummary {
   NodeCount: number
   ProcessingUnits: number
   Instance: string
+  Dialect: string
+  IsSharded: boolean
 }
 
 export interface ISpannerDetails {
   Region: string
   Instance: string
+  Dialect: string
+}
+
+export interface ITableIdAndName {
+  Id: string
+  Name: string
 }
